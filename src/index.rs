@@ -289,15 +289,26 @@ pub struct FilterPred {
     pub after_days: u16,
     pub before_days: u16,
     pub tag_mask: u32,
+    pub source_needle: Option<Vec<u8>>,
 }
 
 impl FilterPred {
-    pub fn none() -> Self { Self { topic_id: None, after_days: 0, before_days: u16::MAX, tag_mask: 0 } }
-    fn passes(&self, m: &EntryMeta) -> bool {
+    pub fn none() -> Self {
+        Self { topic_id: None, after_days: 0, before_days: u16::MAX, tag_mask: 0, source_needle: None }
+    }
+    fn passes(&self, m: &EntryMeta, data: &[u8], src_pool: usize) -> bool {
         if let Some(t) = self.topic_id { if { m.topic_id } != t { return false; } }
         let ed = { m.epoch_days };
         if ed < self.after_days || (self.before_days < u16::MAX && ed > self.before_days) { return false; }
         if self.tag_mask != 0 && ({ m.tag_bitmap } & self.tag_mask) != self.tag_mask { return false; }
+        if let Some(ref needle) = self.source_needle {
+            let sl = { m.source_len } as usize;
+            if sl == 0 { return false; }
+            let so = src_pool + { m.source_off } as usize;
+            if so + sl > data.len() || needle.len() > sl { return false; }
+            let hay = &data[so..so + sl];
+            if !hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle)) { return false; }
+        }
         true
     }
 }
@@ -361,6 +372,7 @@ pub fn search_index(data: &[u8], query: &str, filter: &FilterPred, limit: usize,
     let post_off = { hdr.postings_off } as usize;
     let meta_off = { hdr.meta_off } as usize;
     let snip_off = { hdr.snippet_off } as usize;
+    let src_pool = { hdr.source_off } as usize;
     let data_len = data.len();
     let meta_end = meta_off + num_entries * std::mem::size_of::<EntryMeta>();
     if post_off > data_len || meta_end > data_len || snip_off > data_len {
@@ -396,7 +408,7 @@ pub fn search_index(data: &[u8], query: &str, filter: &FilterPred, limit: usize,
                     let eid = { p.entry_id } as usize;
                     if eid >= num_entries { continue; }
                     let m: EntryMeta = unsafe { read_at_unchecked(data, meta_off + eid * meta_size) };
-                    if !filter.passes(&m) { continue; }
+                    if !filter.passes(&m, data, src_pool) { continue; }
                     if state.entry_gen[eid] != gen {
                         state.scores[eid] = 0.0;
                         state.hit_count[eid] = 0;
@@ -513,6 +525,26 @@ pub fn topic_table(data: &[u8]) -> Result<Vec<(u16, String, u16)>, String> {
         out.push((i as u16, name, { te.entry_count }));
     }
     Ok(out)
+}
+
+/// Get the most recent date_minutes per topic. O(num_entries) sequential scan.
+pub fn topic_recency(data: &[u8]) -> Vec<(u16, i32)> {
+    let hdr = match read_header(data) { Ok(h) => h, Err(_) => return vec![] };
+    let meta_off = { hdr.meta_off } as usize;
+    let n = { hdr.num_entries } as usize;
+    let ntop = { hdr.num_topics } as usize;
+    let meta_size = std::mem::size_of::<EntryMeta>();
+    let mut latest = vec![i32::MIN; ntop];
+    for i in 0..n {
+        if let Ok(m) = read_at::<EntryMeta>(data, meta_off + i * meta_size) {
+            let tid = { m.topic_id } as usize;
+            let dm = { m.date_minutes };
+            if tid < ntop && dm > latest[tid] { latest[tid] = dm; }
+        }
+    }
+    latest.into_iter().enumerate()
+        .filter(|(_, d)| *d > i32::MIN)
+        .map(|(i, d)| (i as u16, d)).collect()
 }
 
 pub fn topic_name(data: &[u8], topic_id: u16) -> Result<String, String> {
@@ -667,11 +699,12 @@ pub struct Filter {
     pub before: Option<i64>,
     pub tag: Option<String>,
     pub topic: Option<String>,
+    pub source: Option<String>,
     pub mode: SearchMode,
 }
 
 impl Filter {
-    pub fn none() -> Self { Self { after: None, before: None, tag: None, topic: None, mode: SearchMode::And } }
+    pub fn none() -> Self { Self { after: None, before: None, tag: None, topic: None, source: None, mode: SearchMode::And } }
 }
 
 /// Unified search: index-first with cache fallback. AND→OR auto-fallback.
@@ -704,6 +737,7 @@ fn build_filter_pred(data: &[u8], filter: &Filter) -> FilterPred {
         after_days: filter.after.map(|d| d.max(0) as u16).unwrap_or(0),
         before_days: filter.before.map(|d| d.min(u16::MAX as i64) as u16).unwrap_or(u16::MAX),
         tag_mask: filter.tag.as_ref().and_then(|t| resolve_tag(data, t)).map(|b| 1u32 << b).unwrap_or(0),
+        source_needle: filter.source.as_ref().map(|s| s.as_bytes().to_vec()),
     }
 }
 

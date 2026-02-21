@@ -48,7 +48,7 @@ pub fn run_brief(dir: &Path, query: &str, limit: Option<usize>, filter: &Filter,
             .find(|l| !crate::text::is_metadata_line(l) && !l.trim().is_empty())
             .map(|l| truncate(l.trim().trim_start_matches("- "), 80))
             .unwrap_or("");
-        let _ = writeln!(out, "  [{}] {content}{tag_suffix}", r.name);
+        let _ = writeln!(out, "  [{}] {content}{tag_suffix} ({:.1})", r.name, r.score);
     }
     if results.is_empty() { let _ = writeln!(out, "no matches for '{query}'"); }
     else { let _ = writeln!(out, "{} match(es)", results.len()); }
@@ -66,7 +66,7 @@ pub fn run_medium(dir: &Path, query: &str, limit: Option<usize>, filter: &Filter
         let header = r.lines.first().map(|s| s.as_str()).unwrap_or("??");
         let tags = extract_tags(&r.lines);
         let tag_str = tags.map(|t| format!(" {t}")).unwrap_or_default();
-        let _ = writeln!(out, "  [{}] {}{}", r.name, header.trim_start_matches("## "), tag_str);
+        let _ = writeln!(out, "  [{}] {}{} ({:.1})", r.name, header.trim_start_matches("## "), tag_str, r.score);
         let mut n = 0;
         for line in r.lines.iter().skip(1) {
             if crate::text::is_metadata_line(line) || line.trim().is_empty() { continue; }

@@ -88,6 +88,34 @@ pub fn query_terms(query: &str) -> Vec<String> {
     terms
 }
 
+/// Extract field prefixes (tag:X, topic:X, source:X) from a query string.
+/// Returns the remaining query with prefixes stripped and the extracted filters.
+pub struct QueryFilters {
+    pub query: String,
+    pub tag: Option<String>,
+    pub topic: Option<String>,
+    pub source: Option<String>,
+}
+
+pub fn parse_query_filters(raw: &str) -> QueryFilters {
+    let mut tag = None;
+    let mut topic = None;
+    let mut source = None;
+    let mut remaining = Vec::with_capacity(8);
+    for word in raw.split_whitespace() {
+        if let Some(val) = word.strip_prefix("tag:") {
+            if !val.is_empty() { tag = Some(val.to_lowercase()); }
+        } else if let Some(val) = word.strip_prefix("topic:") {
+            if !val.is_empty() { topic = Some(val.to_string()); }
+        } else if let Some(val) = word.strip_prefix("source:") {
+            if !val.is_empty() { source = Some(val.to_string()); }
+        } else {
+            remaining.push(word);
+        }
+    }
+    QueryFilters { query: remaining.join(" "), tag, topic, source }
+}
+
 #[inline]
 fn ascii_lower(bytes: &[u8]) -> String {
     let mut v = bytes.to_vec();

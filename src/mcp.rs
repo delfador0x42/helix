@@ -13,6 +13,7 @@ static SESSION_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static INDEX: RwLock<Option<Vec<u8>>> = RwLock::new(None);
 static INDEX_DIRTY: AtomicBool = AtomicBool::new(false);
 static DIRTY_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+static REBUILD_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn log_session(msg: String) {
     if let Ok(mut log) = SESSION_LOG.lock() { log.push(msg); }
@@ -32,26 +33,33 @@ pub(crate) fn after_write(_dir: &Path) {
     if let Ok(mut g) = DIRTY_AT.lock() { if g.is_none() { *g = Some(std::time::Instant::now()); } }
 }
 
+/// Async index rebuild — reads never block. Old index serves reads while rebuild
+/// runs in a background thread. REBUILD_ACTIVE prevents concurrent rebuilds.
 fn ensure_index_fresh(dir: &Path) {
     if !INDEX_DIRTY.load(Ordering::Acquire) { return; }
-    let should = DIRTY_AT.lock().ok().map_or(false, |mut g| {
-        match *g {
-            Some(t) if t.elapsed() < std::time::Duration::from_millis(50) => false,
-            _ => if INDEX_DIRTY.compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed).is_ok()
-                { *g = None; true } else { false },
-        }
+    let should = DIRTY_AT.lock().ok().map_or(false, |g| {
+        matches!(*g, Some(t) if t.elapsed() >= std::time::Duration::from_millis(50))
     });
-    if should {
-        match crate::index::rebuild(dir, true) {
+    if !should { return; }
+    // CAS: only one rebuild thread at a time
+    if REBUILD_ACTIVE.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    INDEX_DIRTY.store(false, Ordering::Release);
+    if let Ok(mut g) = DIRTY_AT.lock() { *g = None; }
+    let dir = dir.to_path_buf();
+    std::thread::spawn(move || {
+        match crate::index::rebuild(&dir, true) {
             Ok((_, bytes)) => store_index(bytes),
             Err(_) => { if let Ok(d) = std::fs::read(dir.join("index.bin")) { store_index(d); } }
         }
-    }
+        REBUILD_ACTIVE.store(false, Ordering::Release);
+    });
 }
 
 // ══════════ Server Loop ══════════
 
-const INIT_RESULT: &str = r#"{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"helix","version":"1.0.0"}}"#;
+const INIT_RESULT: &str = r#"{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"helix","version":"1.1.0"}}"#;
 
 pub fn run(dir: &Path) -> Result<(), String> {
     crate::config::ensure_dir(dir)?;
@@ -321,8 +329,15 @@ fn dispatch_batch(args: Option<&Value>, dir: &Path) -> Result<String, String> {
 }
 
 fn dispatch_search(args: Option<&Value>, dir: &Path) -> Result<String, String> {
-    let query = arg(args, "query"); let detail = arg(args, "detail");
-    let filter = build_filter(args);
+    let raw_query = arg(args, "query"); let detail = arg(args, "detail");
+    // Parse field prefixes (tag:X, topic:X, source:X) from query string
+    let parsed = crate::text::parse_query_filters(raw_query);
+    let query = if parsed.query.is_empty() { raw_query } else { &parsed.query };
+    let mut filter = build_filter(args);
+    // Query prefixes fill in filters not already set by explicit params
+    if filter.tag.is_none() { filter.tag = parsed.tag; }
+    if filter.topic.is_none() { filter.topic = parsed.topic; }
+    if filter.source.is_none() { filter.source = parsed.source; }
     let limit = arg(args, "limit").parse::<usize>().ok();
     match detail {
         "count" => crate::search::count(dir, query, &filter),
@@ -649,6 +664,7 @@ fn build_filter(args: Option<&Value>) -> crate::index::Filter {
         before: if before.is_empty() { None } else { crate::time::parse_date_days(&before) },
         tag: if tag.is_empty() { None } else { Some(tag.to_string()) },
         topic: if topic.is_empty() { None } else { Some(topic.to_string()) },
+        source: None,
         mode: if arg(args, "mode") == "or" { crate::index::SearchMode::Or } else { crate::index::SearchMode::And },
     }
 }

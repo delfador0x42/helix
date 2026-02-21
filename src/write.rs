@@ -18,6 +18,11 @@ pub fn store(
 
     let dupe_warn = if !force { check_dupe(dir, topic, text) } else { None };
 
+    // Count existing entries for this topic before appending (= 0-based index of new entry)
+    let entry_index = crate::cache::with_corpus(dir, |cached| {
+        cached.iter().filter(|e| *e.topic == *topic).count()
+    }).unwrap_or(0);
+
     let offset = crate::datalog::append_entry(&log_path, topic, &body, ts_min)?;
     crate::cache::append_to_cache(dir, topic, &body, ts_min, offset);
 
@@ -25,7 +30,7 @@ pub fn store(
         .map(|t| format!(" [tags: {t}]")).unwrap_or_default();
     let conf_echo = confidence.filter(|c| *c < 1.0)
         .map(|c| format!(" (~{:.0}%)", c * 100.0)).unwrap_or_default();
-    let mut msg = format!("stored in {topic}{tag_echo}{conf_echo}");
+    let mut msg = format!("stored in {topic}[{entry_index}]{tag_echo}{conf_echo}");
     if let Some(ref dw) = dupe_warn { msg.push_str(&format!("\n  dupe warning: {dw}")); }
     Ok(msg)
 }

@@ -112,7 +112,13 @@ fn session(input: &str, dir: &Path) -> Result<String, String> {
     push_u32(&mut msg, topics.len() as u32);
     msg.push_str(" topics.\nTopics: ");
     let mut sorted = topics;
-    sorted.sort_by(|a, b| b.2.cmp(&a.2));
+    // Sort by recency (most recently updated first), not entry count
+    let recency = crate::index::topic_recency(data);
+    sorted.sort_by(|a, b| {
+        let ra = recency.iter().find(|&&(id, _)| id == a.0).map(|&(_, d)| d).unwrap_or(0);
+        let rb = recency.iter().find(|&&(id, _)| id == b.0).map(|&(_, d)| d).unwrap_or(0);
+        rb.cmp(&ra)
+    });
     for (i, (_, name, count)) in sorted.iter().take(15).enumerate() {
         if i > 0 { msg.push_str(", "); }
         msg.push_str(name);
@@ -133,12 +139,25 @@ fn prompt_submit(input: &str, dir: &Path) -> Result<String, String> {
     let prompt_text = extract_json_str(input, "prompt").unwrap_or("");
     if prompt_text.len() < 10 || prompt_text.len() > 500 { return Ok(String::new()); }
 
+    // Signal gate: detect knowledge questions vs commands/greetings.
+    // Only match question words at the START of the prompt or with '?'.
+    let lower = prompt_text.as_bytes();
+    let has_question = prompt_text.contains('?')
+        || (lower.len() > 4 && matches!(&lower[..4], b"how " | b"How " | b"what" | b"What"
+            | b"why " | b"Why " | b"wher" | b"Wher"));
     let data = match mmap_index(dir) { Some(d) => d, None => return Ok(String::new()) };
     let terms = crate::text::query_terms(prompt_text);
     if terms.len() < 2 { return Ok(String::new()); }
+    // Non-questions need 3+ substantive terms to be worth searching
+    if !has_question && terms.len() < 3 { return Ok(String::new()); }
 
     let query = terms.iter().take(6).cloned().collect::<Vec<_>>().join(" ");
-    let hits = idx_search_or(data, &query, 3);
+    // Use AND mode first (all terms must match) — much more selective than OR.
+    // Only fall back to OR for questions with 2 terms (where AND is too strict).
+    let hits = idx_search(data, &query, 3);
+    let hits = if hits.is_empty() && has_question {
+        idx_search_or(data, &query, 3)
+    } else { hits };
     if hits.is_empty() { return Ok(String::new()); }
 
     let mut out = String::with_capacity(256);
@@ -187,12 +206,16 @@ fn ambient(input: &str, dir: &Path) -> Result<String, String> {
 
 // ══════════ Hook: PostToolUse (Build) ══════════
 
-/// After build commands, remind to store results. Async — non-blocking.
+/// After build commands, remind to store results — only on failure.
 fn post_build(input: &str) -> Result<String, String> {
     let is_build = (input.contains("xcodebuild") && input.contains("build"))
         || input.contains("cargo build") || input.contains("swift build")
         || input.contains("swiftc ");
     if !is_build { return Ok(String::new()); }
+    // Signal gate: only fire on build failures, not successes
+    let has_error = input.contains("error:") || input.contains("error[E")
+        || input.contains("BUILD FAILED") || input.contains("** FAILED **");
+    if !has_error { return Ok(String::new()); }
     Ok(POST_BUILD_RESPONSE.into())
 }
 
@@ -231,7 +254,12 @@ fn pre_compact(dir: &Path) -> Result<String, String> {
     push_u32(&mut msg, topics.len() as u32);
     msg.push_str(" topics available. After compaction, search helix for knowledge.\nTopics: ");
     let mut sorted = topics;
-    sorted.sort_by(|a, b| b.2.cmp(&a.2));
+    let recency = crate::index::topic_recency(data);
+    sorted.sort_by(|a, b| {
+        let ra = recency.iter().find(|&&(id, _)| id == a.0).map(|&(_, d)| d).unwrap_or(0);
+        let rb = recency.iter().find(|&&(id, _)| id == b.0).map(|&(_, d)| d).unwrap_or(0);
+        rb.cmp(&ra)
+    });
     for (i, (_, name, count)) in sorted.iter().take(15).enumerate() {
         if i > 0 { msg.push_str(", "); }
         msg.push_str(name); msg.push_str(" ("); push_u32(&mut msg, *count as u32); msg.push(')');
@@ -256,7 +284,17 @@ fn stop(input: &str) -> Result<String, String> {
         }
     }
     std::fs::write(stamp, now.to_string()).ok();
-    Ok(hook_output("STOPPING: Store any non-obvious findings in helix before ending."))
+    // Context-aware: check if user has been storing findings recently
+    let dir = crate::config::resolve_dir(None);
+    let recently_stored = std::fs::metadata(dir.join("data.log")).ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|mt| mt.elapsed().ok())
+        .map(|e| e.as_secs() < 1800).unwrap_or(false);
+    if recently_stored {
+        Ok(hook_output("STOPPING: You've been storing findings. Anything else to capture?"))
+    } else {
+        Ok(hook_output("STOPPING: No findings stored recently. Capture non-obvious learnings before ending."))
+    }
 }
 
 // ══════════ Hook: SubagentStart ══════════
@@ -426,6 +464,9 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str]) ->
     let l5 = pool.len() - l5_start;
 
     if pool.is_empty() { return String::new(); }
+    // Signal gate: if no source-linked entries (L1) and no stem matches (L3),
+    // the file is unknown to the KB — suppress rather than emit weak context
+    if l1 == 0 && l3 == 0 { return String::new(); }
 
     // Single output pass
     let est = pool.iter().map(|s| s.len() + 4).sum::<usize>() + 5 * 40;
