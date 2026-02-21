@@ -645,6 +645,15 @@ pub fn entry_snippet_ref(data: &[u8], entry_id: u32) -> Result<&str, String> {
     Ok(std::str::from_utf8(&data[so..so + sl]).unwrap_or(""))
 }
 
+/// Get topic_id for an entry. O(1) — single EntryMeta read.
+pub fn entry_topic_id(data: &[u8], entry_id: u32) -> Result<u16, String> {
+    let hdr = read_header(data)?;
+    let meta_off = { hdr.meta_off } as usize;
+    if entry_id as usize >= { hdr.num_entries } as usize { return Err("entry_id out of range".into()); }
+    let m = read_at::<EntryMeta>(data, meta_off + entry_id as usize * std::mem::size_of::<EntryMeta>())?;
+    Ok(m.topic_id)
+}
+
 pub fn entries_for_topic(data: &[u8], topic_id: u16) -> Result<Vec<u32>, String> {
     let hdr = read_header(data)?;
     let meta_off = { hdr.meta_off } as usize;

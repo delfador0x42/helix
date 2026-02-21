@@ -110,6 +110,13 @@ pub fn run(dir: &Path) -> Result<(), String> {
                 let p = msg.get("params");
                 let name = p.and_then(|p| p.get("name")).and_then(|v| v.as_str()).unwrap_or("");
                 let id_json = id_to_json(id);
+                if name == "_reload" {
+                    let mut out = stdout.lock();
+                    let _ = write_rpc_ok(&mut out, &id_json, "reloading helix...");
+                    let _ = out.flush(); drop(out);
+                    do_reload();
+                    continue;
+                }
                 let args = p.and_then(|p| p.get("arguments"));
                 let mut out = stdout.lock();
                 let ok = match dispatch(name, args, dir) {
@@ -798,5 +805,26 @@ fn tool_list() -> Value {
               ("focus", "string", "Glob pattern to filter topics (graph action)"),
               ("json", "string", "JSON string to import (import action)"),
               ("refresh", "string", "Set to 'true' to show stale entries + current source (stale action)")]),
+        tool("_reload", "Re-exec the server binary to pick up code changes.", &[], &[]),
     ])
+}
+
+/// Copy release binary over installed binary, codesign, re-exec.
+fn do_reload() {
+    use std::os::unix::process::CommandExt;
+    let exe = match std::env::current_exe() { Ok(p) => p, Err(_) => return };
+    let home = std::env::var("HOME").unwrap_or_default();
+    let src = std::path::PathBuf::from(&home).join("wudan/dojo/crash3/llm_double_helix/target/release/helix");
+    if src.exists() {
+        let tmp = exe.with_extension("tmp");
+        if std::fs::copy(&src, &tmp).is_ok() {
+            if std::fs::rename(&tmp, &exe).is_ok() {
+                let _ = std::process::Command::new("codesign")
+                    .args(["-s", "-", "-f"]).arg(&exe).output();
+            } else { let _ = std::fs::remove_file(&tmp); }
+        }
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let _err = std::process::Command::new(&exe).args(&args).exec();
+    eprintln!("helix reload failed: {_err}");
 }

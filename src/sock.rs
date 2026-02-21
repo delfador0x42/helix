@@ -116,7 +116,7 @@ fn handle_ambient_fast(line: &str) -> String {
     let file_path = crate::hook::extract_json_str(line, "\"path\"").unwrap_or("");
     let syms = extract_syms_array(line);
     crate::mcp::with_index(|data| {
-        crate::hook::query_ambient(data, stem, file_path, &syms)
+        crate::hook::query_ambient(data, stem, file_path, &syms, None)
     }).unwrap_or_default()
 }
 
@@ -176,7 +176,7 @@ fn handle_hook_relay(line: &str) -> String {
     let sym_refs: Vec<&str> = syms.iter().map(|s| s.as_str()).collect();
 
     let ctx = crate::mcp::with_index(|data| {
-        crate::hook::query_ambient(data, stem, path, &sym_refs)
+        crate::hook::query_ambient(data, stem, path, &sym_refs, None)
     }).unwrap_or_default();
     if ctx.is_empty() { return String::new(); }
     crate::hook::hook_output(&ctx)

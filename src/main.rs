@@ -12,6 +12,7 @@ mod search;
 mod brief;
 mod write;
 mod mcp;
+mod session;
 mod hook;
 mod sock;
 

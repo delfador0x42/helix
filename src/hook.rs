@@ -205,7 +205,13 @@ fn ambient(input: &str, dir: &Path) -> Result<String, String> {
 
     let data = match mmap_index(dir) { Some(d) => d, None => return Ok(String::new()) };
     let sym_refs: Vec<&str> = syms.iter().map(|s| s.as_str()).collect();
-    let out = query_ambient(data, stem, file_path, &sym_refs);
+
+    // Session accumulator: load, track, pass to query_ambient, save
+    let mut session = crate::session::Session::load_or_new();
+    session.record_tool(tool);
+    session.track_file(is_edit || tool == "Write" || tool == "NotebookEdit");
+    let out = query_ambient(data, stem, file_path, &sym_refs, Some(&mut session));
+    session.save();
     if out.is_empty() { return Ok(String::new()); }
     Ok(hook_output(&out))
 }
@@ -281,6 +287,10 @@ fn post_build(input: &str, dir: &Path) -> Result<String, String> {
         for e in &errors { ctx.push_str("  "); ctx.push_str(e); ctx.push('\n'); }
         if !kb_out.is_empty() { ctx.push_str("helix matches:\n"); ctx.push_str(&kb_out); }
         ctx.push_str("Store non-obvious root causes: mcp__helix__store(topic:'build-gotchas', ...)");
+        // Record failed build in session
+        let mut session = crate::session::Session::load_or_new();
+        session.record_build(false);
+        session.save();
         Ok(hook_output(&ctx))
     } else {
         // Build succeeded — check for fix-pair resolution
@@ -295,6 +305,10 @@ fn post_build(input: &str, dir: &Path) -> Result<String, String> {
             }
             std::fs::remove_file(marker).ok();
         }
+        // Record successful build in session
+        let mut session = crate::session::Session::load_or_new();
+        session.record_build(true);
+        session.save();
         Ok(String::new())
     }
 }
@@ -392,11 +406,33 @@ fn subagent_start(dir: &Path) -> Result<String, String> {
             Some(list.join(", "))
         })
         .or_else(|| crate::sock::query(dir, r#"{"op":"topics"}"#));
+    // Check session: if parent already injected context, tell subagent
+    let session = crate::session::Session::load();
+    let injected_count = session.as_ref().map(|s| s.injected.len()).unwrap_or(0);
+    let focus = session.as_ref().map(|s| &s.focus_topics);
+
     let msg = match topic_list {
-        Some(list) if !list.is_empty() => format!(
-            "HELIX KNOWLEDGE STORE: You have access to helix MCP tools. \
-             BEFORE starting work, call mcp__helix__search with keywords \
-             relevant to your task. Topics: {list}"),
+        Some(list) if !list.is_empty() => {
+            let mut m = String::with_capacity(256 + list.len());
+            m.push_str("HELIX KNOWLEDGE STORE: You have access to helix MCP tools. ");
+            if injected_count > 10 {
+                m.push_str("Parent session already has context loaded. ");
+            }
+            if let Some(ft) = focus {
+                if !ft.is_empty() {
+                    m.push_str("Focus topics: ");
+                    for (i, t) in ft.iter().take(5).enumerate() {
+                        if i > 0 { m.push_str(", "); }
+                        m.push_str(t);
+                    }
+                    m.push_str(". ");
+                }
+            }
+            m.push_str("BEFORE starting work, call mcp__helix__search with keywords \
+                         relevant to your task. Topics: ");
+            m.push_str(&list);
+            m
+        }
         _ => fallback.into(),
     };
     Ok(hook_output(&msg))
@@ -471,10 +507,16 @@ pub fn extract_removed_syms(input: &crate::json::Value, stem: &str) -> Vec<Strin
 ///
 /// Adaptive: Layer 2 skipped when Layer 1 returns 5+ hits.
 /// Cow<str>: Layer 1 borrows from mmap (zero alloc), other layers own.
-pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str]) -> String {
+pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], session: Option<&mut crate::session::Session>) -> String {
     let filename = std::path::Path::new(file_path)
         .file_name().and_then(|f| f.to_str()).unwrap_or(stem);
+    // Snapshot injected set for dedup (avoids borrow conflict with mutable session)
+    let injected_snapshot = session.as_ref().map(|s| s.injected.clone());
     let mut seen = crate::fxhash::FxHashSet::default();
+    // Pre-populate seen with previously injected entries
+    if let Some(ref snap) = injected_snapshot {
+        for &eid in snap.iter() { seen.insert(eid); }
+    }
     let mut pool: Vec<std::borrow::Cow<str>> = Vec::with_capacity(32);
 
     // Layer 1: Source-path matches
@@ -543,10 +585,44 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str]) ->
     }
     let l5 = pool.len() - l5_start;
 
+    // Directory fallback: when file stem is unknown to KB, try parent dir name.
+    // Catches new files in known directories (e.g. new probe in Scanners/).
+    if pool.is_empty() || (l1 == 0 && l3 == 0) {
+        let dir_name = std::path::Path::new(file_path).parent()
+            .and_then(|p| p.file_name()).and_then(|f| f.to_str()).unwrap_or("");
+        if dir_name.len() >= 3 && dir_name != stem {
+            for h in idx_search(data, dir_name, 3) {
+                if seen.insert(h.entry_id) {
+                    pool.push(std::borrow::Cow::Owned(h.snippet));
+                }
+            }
+        }
+    }
     if pool.is_empty() { return String::new(); }
-    // Signal gate: if no source-linked entries (L1) and no stem matches (L3),
-    // the file is unknown to the KB — suppress rather than emit weak context
-    if l1 == 0 && l3 == 0 { return String::new(); }
+
+    // Session bookkeeping: mark injected entries + auto-infer focus topics
+    if let Some(sess) = session {
+        // Mark all entries we're about to inject
+        for &eid in &seen {
+            if injected_snapshot.as_ref().map(|s| !s.contains(&eid)).unwrap_or(true) {
+                sess.mark_injected(eid);
+            }
+        }
+        // Auto-infer focus topics: count topic_ids, add topics with 3+ hits
+        let mut topic_hits: crate::fxhash::FxHashMap<u16, u16> = crate::fxhash::FxHashMap::default();
+        for &eid in &seen {
+            if let Ok(tid) = crate::index::entry_topic_id(data, eid) {
+                *topic_hits.entry(tid).or_insert(0) += 1;
+            }
+        }
+        for (&tid, &count) in &topic_hits {
+            if count >= 3 {
+                if let Ok(name) = crate::index::topic_name(data, tid) {
+                    sess.add_focus_topic(&name);
+                }
+            }
+        }
+    }
 
     // Single output pass
     let est = pool.iter().map(|s| s.len() + 4).sum::<usize>() + 5 * 40;
@@ -572,6 +648,17 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str]) ->
             _ => {}
         }
         for _ in 0..count {
+            out.push_str("  "); out.push_str(&pool[pool_idx]); out.push('\n');
+            pool_idx += 1;
+        }
+    }
+    // Directory fallback entries (after L1-L5)
+    if pool_idx < pool.len() {
+        let dir_name = std::path::Path::new(file_path).parent()
+            .and_then(|p| p.file_name()).and_then(|f| f.to_str()).unwrap_or("directory");
+        if !out.is_empty() { out.push_str("---\n"); }
+        out.push_str("directory context ("); out.push_str(dir_name); out.push_str("):\n");
+        while pool_idx < pool.len() {
             out.push_str("  "); out.push_str(&pool[pool_idx]); out.push('\n');
             pool_idx += 1;
         }
