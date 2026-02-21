@@ -18,7 +18,7 @@ pub fn run(dir: &Path, query: &str, limit: Option<usize>, filter: &Filter,
     let mut last_name = String::new();
     for r in results.iter().take(show) {
         if r.name != last_name {
-            let _ = writeln!(out, "\n--- {} ---", r.name);
+            let _ = writeln!(out, "\n--- {} ({:.1}) ---", r.name, r.score);
             last_name = r.name.clone();
         }
         for line in &r.lines {

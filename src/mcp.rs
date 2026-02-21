@@ -36,6 +36,15 @@ pub(crate) fn after_write(_dir: &Path) {
 /// Async index rebuild — reads never block. Old index serves reads while rebuild
 /// runs in a background thread. REBUILD_ACTIVE prevents concurrent rebuilds.
 fn ensure_index_fresh(dir: &Path) {
+    // Detect external writes (hook auto-capture writes to data.log directly)
+    if !INDEX_DIRTY.load(Ordering::Acquire) {
+        let marker = std::path::Path::new("/tmp/helix-external-write");
+        if marker.exists() {
+            std::fs::remove_file(marker).ok();
+            INDEX_DIRTY.store(true, Ordering::Release);
+            if let Ok(mut g) = DIRTY_AT.lock() { *g = Some(std::time::Instant::now()); }
+        }
+    }
     if !INDEX_DIRTY.load(Ordering::Acquire) { return; }
     let should = DIRTY_AT.lock().ok().map_or(false, |g| {
         matches!(*g, Some(t) if t.elapsed() >= std::time::Duration::from_millis(50))
@@ -59,7 +68,7 @@ fn ensure_index_fresh(dir: &Path) {
 
 // ══════════ Server Loop ══════════
 
-const INIT_RESULT: &str = r#"{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"helix","version":"1.1.0"}}"#;
+const INIT_RESULT: &str = r#"{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"helix","version":"1.2.0"}}"#;
 
 pub fn run(dir: &Path) -> Result<(), String> {
     crate::config::ensure_dir(dir)?;

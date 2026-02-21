@@ -28,7 +28,7 @@ pub fn run(hook_type: &str, dir: &Path) -> Result<String, String> {
         "session" => session(input, dir),
         "prompt" => prompt_submit(input, dir),
         "ambient" => ambient(input, dir),
-        "post-build" => post_build(input),
+        "post-build" => post_build(input, dir),
         "error-context" => error_context(input, dir),
         "pre-compact" => pre_compact(dir),
         "stop" => stop(input),
@@ -62,6 +62,12 @@ pub fn hook_output(context: &str) -> String {
     crate::json::escape_into(context, &mut out);
     out.push_str(r#""}}"#);
     out
+}
+
+/// Auto-store low-confidence entry from hook. Errors silently ignored.
+fn auto_store(dir: &Path, topic: &str, text: &str, tags: &str) {
+    let _ = crate::write::store(dir, topic, text, Some(tags), true, None, Some(0.3), None);
+    std::fs::write("/tmp/helix-external-write", b"1").ok();
 }
 
 /// Index search: AND mode (all terms required).
@@ -206,17 +212,91 @@ fn ambient(input: &str, dir: &Path) -> Result<String, String> {
 
 // ══════════ Hook: PostToolUse (Build) ══════════
 
-/// After build commands, remind to store results — only on failure.
-fn post_build(input: &str) -> Result<String, String> {
+/// After build commands: auto-capture errors, search KB, track fix-pairs.
+fn post_build(input: &str, dir: &Path) -> Result<String, String> {
     let is_build = (input.contains("xcodebuild") && input.contains("build"))
         || input.contains("cargo build") || input.contains("swift build")
         || input.contains("swiftc ");
     if !is_build { return Ok(String::new()); }
-    // Signal gate: only fire on build failures, not successes
+
     let has_error = input.contains("error:") || input.contains("error[E")
         || input.contains("BUILD FAILED") || input.contains("** FAILED **");
-    if !has_error { return Ok(String::new()); }
-    Ok(POST_BUILD_RESPONSE.into())
+
+    if has_error {
+        // Extract tool_response to avoid JSON wrapper noise in error lines
+        let response = extract_json_str(input, "tool_response").unwrap_or(input);
+        let mut errors: Vec<String> = Vec::with_capacity(5);
+        // Split on JSON-escaped newlines (\n = 2 chars) and real newlines
+        for part in response.split("\\n").flat_map(|s| s.split('\n')) {
+            if errors.len() >= 5 { break; }
+            let t = part.trim();
+            if (t.contains(": error:") || t.contains("error[E"))
+                && !errors.iter().any(|e| e == t)
+            {
+                let line = crate::text::truncate(t, 200);
+                errors.push(line.to_string());
+            }
+        }
+        if errors.is_empty() {
+            for part in response.split("\\n").flat_map(|s| s.split('\n')) {
+                if errors.len() >= 3 { break; }
+                let t = part.trim();
+                if t.contains("BUILD FAILED") || t.contains("** FAILED **") || t.contains("aborting") {
+                    errors.push(crate::text::truncate(t, 200).to_string());
+                }
+            }
+        }
+
+        // Auto-store errors at low confidence
+        if !errors.is_empty() {
+            let text = errors.join("\n");
+            auto_store(dir, "build-errors", &text, "auto, build-error");
+            std::fs::write("/tmp/helix-build-errors", text.as_bytes()).ok();
+        }
+
+        // Search KB for matching error patterns
+        let mut kb_out = String::new();
+        if let Some(data) = mmap_index(dir) {
+            let mut total = 0;
+            for err in &errors {
+                if total >= 3 { break; }
+                let terms = crate::text::query_terms(err);
+                if terms.len() < 2 { continue; }
+                let q = terms.iter().take(6).cloned().collect::<Vec<_>>().join(" ");
+                for h in idx_search_or(data, &q, 2) {
+                    if total >= 3 { break; }
+                    kb_out.push_str("  ");
+                    kb_out.push_str(&h.snippet);
+                    kb_out.push('\n');
+                    total += 1;
+                }
+            }
+        }
+
+        // Build output for Claude's context
+        let mut ctx = String::with_capacity(256);
+        ctx.push_str("BUILD FAILED (");
+        crate::text::itoa_push(&mut ctx, errors.len() as u32);
+        ctx.push_str(" errors):\n");
+        for e in &errors { ctx.push_str("  "); ctx.push_str(e); ctx.push('\n'); }
+        if !kb_out.is_empty() { ctx.push_str("helix matches:\n"); ctx.push_str(&kb_out); }
+        ctx.push_str("Store non-obvious root causes: mcp__helix__store(topic:'build-gotchas', ...)");
+        Ok(hook_output(&ctx))
+    } else {
+        // Build succeeded — check for fix-pair resolution
+        let marker = std::path::Path::new("/tmp/helix-build-errors");
+        if marker.exists() {
+            if let Ok(prior) = std::fs::read_to_string(marker) {
+                let first = prior.lines().next().unwrap_or("unknown error");
+                let mut text = String::with_capacity(12 + first.len().min(120));
+                text.push_str("RESOLVED: ");
+                text.push_str(crate::text::truncate(first, 120));
+                auto_store(dir, "build-errors", &text, "auto, build-fix");
+            }
+            std::fs::remove_file(marker).ok();
+        }
+        Ok(String::new())
+    }
 }
 
 // ══════════ Hook: PostToolUseFailure (Error Context) ══════════
@@ -691,4 +771,4 @@ fn push_u64(buf: &mut String, n: u64) {
 const APPROVE_MCP_RESPONSE: &str =
     r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
 
-const POST_BUILD_RESPONSE: &str = r#"{"systemMessage":"BUILD COMPLETED. If the build failed with a non-obvious error, store the root cause in helix (topic: build-gotchas). If it succeeded after fixing an issue, store what fixed it."}"#;
+
