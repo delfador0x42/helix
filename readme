@@ -1,0 +1,29 @@
+project name :: llm_double_helix
+Rewrite Plan:  v1.0.0
+Current: 9,821 lines, 45 files, 32 MCP tools
+Target: ~3,000 lines, 17 files, 7 MCP tools
+
+The 7 Tools
+Tool	Purpose	Params
+store	Store knowledge	topic, text (string or JSON array for batch), tags, source, confidence
+search	BM25 keyword search	query, detail (full/brief/count), limit, after, before, tag, topic
+brief	Mental model loader	query (topic, glob, keyword), detail (summary/full), since, focus
+read	Read topic/entry	topic, index (optional, for specific entry)
+edit	All mutations	topic, op (append/revise/delete/delete_all/tag/untag/rename/merge), text, index/match_str
+topics	Browse	mode (list/recent/stats), days
+admin	Maintenance	op (reindex/export/import/compact/prune/stale/xref/graph/reload)
+Key Numbers
+2,631 lines cut (trace, C FFI, install, maintenance standalone files)
+4 major merges: index.rs (3→1), brief.rs (3→1), write.rs (3→1), mcp.rs (3→1)
+Context savings: ~15KB → ~2.8KB tool schemas (80% reduction)
+Hook changes: Kill post-build (noise), keep ambient+stop+subagent
+Preserved Invariants
+Append-only data.log, atomic index.bin, zero dependencies, three-tier latency, BM25 scoring, FxHash, mtime cache invalidation, QueryState generation counter, debounced rebuild. All correct architectural decisions survive.
+
+Improvements Over Current
+Score-proportional diversity cap (fixes search noise)
+No post-build hook spam
+80% less context consumption
+Consolidated output modes (3 search modes, 2 brief tiers)
+Auto-batch detection in store
+Everything is stored in amaranthine-rewrite [though your working on the llm_double_helix project] topic (18 entries) for future session decompression. Ready to start writing code when you give the word.

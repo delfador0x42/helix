@@ -1,0 +1,16 @@
+[package]
+name = "llm_double_helix"
+version = "1.0.0"
+edition = "2021"
+description = "Fast local knowledge base for AI-assisted development. 7 MCP tools, zero dependencies."
+
+[[bin]]
+name = "helix"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
