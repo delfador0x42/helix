@@ -209,7 +209,7 @@ fn error_context(input: &str, dir: &Path) -> Result<String, String> {
     if terms.len() < 2 { return Ok(String::new()); }
 
     let query = terms.iter().take(8).cloned().collect::<Vec<_>>().join(" ");
-    let hits = idx_search(data, &query, 3);
+    let hits = idx_search_or(data, &query, 3);
     if hits.is_empty() { return Ok(String::new()); }
 
     let mut out = String::with_capacity(256);
