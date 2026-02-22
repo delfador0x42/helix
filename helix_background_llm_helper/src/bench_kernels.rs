@@ -336,18 +336,22 @@ pub fn run() {
     });
 
     // ── Batch matmul Q4_0 ──
-    eprintln!("\n--- Batch Matmul (simdgroup_float8x8 tiled) ---");
+    eprintln!("\n--- Batch Matmul (B={} explicit accumulators, coalesced) ---",
+        crate::kernels_batch::BATCH_SIZE);
     {
         let batch_src = crate::kernels_batch::all_batch_kernels();
         let batch_lib = dev.new_library_with_source(&batch_src).unwrap();
         let p_bm_q4_0 = dev.new_compute_pipeline(
             &batch_lib.get_function("matmul_q4_0").unwrap()).unwrap();
+        let nb = crate::kernels_batch::BATCH_NB;
 
         // Test at various batch sizes with Llama-1B dimensions
-        // Q proj: [2048 × 2048] @ X[2048 × B] → Y[2048 × B]
+        // Pad X to BATCH_SIZE columns for unconditional reads in specialized kernel
+        let bs = crate::kernels_batch::BATCH_SIZE;
         for b in [1u32, 4, 8, 16, 25, 32, 64] {
-            let x_batch = dev.new_buffer(hidden as u64 * b as u64 * 4);
-            let y_batch = dev.new_buffer(hidden as u64 * b as u64 * 4);
+            let buf_b = b.max(bs);
+            let x_batch = dev.new_buffer(hidden as u64 * buf_b as u64 * 4);
+            let y_batch = dev.new_buffer(hidden as u64 * buf_b as u64 * 4);
             let rows_val = hidden;
             let cols_val = hidden;
             bench(&format!("matmul_q4_0 [{hidden}x{hidden}] B={b}"), ITERS, &queue, |enc| {
@@ -358,19 +362,20 @@ pub fn run() {
                 enc.set_bytes(3, &cols_val as *const u32 as *const c_void, 4);
                 enc.set_bytes(4, &rows_val as *const u32 as *const c_void, 4);
                 enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
-                let grid_x = (rows_val + 31) / 32;
-                let grid_y = (b + 31) / 32;
+                let grid_x = (rows_val + 7) / 8;
+                let grid_y = (b + nb - 1) / nb;
                 enc.dispatch_threadgroups(
                     MTLSize::new(grid_x as u64, grid_y as u64, 1),
-                    MTLSize::new(128, 1, 1), // 4 simdgroups × 32 threads
+                    MTLSize::new(256, 1, 1), // 8 simdgroups × 32 threads
                 );
             });
         }
 
         // FFN gate: [8192 × 2048] @ X[2048 × B] → Y[8192 × B]
         for b in [1u32, 8, 25, 32] {
-            let x_batch = dev.new_buffer(hidden as u64 * b as u64 * 4);
-            let y_batch = dev.new_buffer(ffn as u64 * b as u64 * 4);
+            let buf_b = b.max(bs);
+            let x_batch = dev.new_buffer(hidden as u64 * buf_b as u64 * 4);
+            let y_batch = dev.new_buffer(ffn as u64 * buf_b as u64 * 4);
             let rows_val = ffn;
             let cols_val = hidden;
             bench(&format!("matmul_q4_0 [{ffn}x{hidden}] B={b}"), ITERS, &queue, |enc| {
@@ -381,12 +386,353 @@ pub fn run() {
                 enc.set_bytes(3, &cols_val as *const u32 as *const c_void, 4);
                 enc.set_bytes(4, &rows_val as *const u32 as *const c_void, 4);
                 enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
-                let grid_x = (rows_val + 31) / 32;
-                let grid_y = (b + 31) / 32;
+                let grid_x = (rows_val + 7) / 8;
+                let grid_y = (b + nb - 1) / nb;
                 enc.dispatch_threadgroups(
                     MTLSize::new(grid_x as u64, grid_y as u64, 1),
-                    MTLSize::new(64, 1, 1),
+                    MTLSize::new(256, 1, 1),
                 );
+            });
+        }
+
+        // Full forward simulation with batch matmul (all dispatches in 1 encoder)
+        eprintln!("\n--- Batch Full Forward Simulation ---");
+        for b in [1u32, 4, 8, 16, 25, 32] {
+            // Pad to BATCH_SIZE for unconditional reads; use max(ffn,hidden) cols for down proj
+            let buf_b = b.max(bs) as u64;
+            let max_cols = ffn.max(hidden) as u64;
+            let xb = dev.new_buffer(max_cols * buf_b * 4);
+            let yb = dev.new_buffer(hidden as u64 * buf_b * 4);
+            let yb_ffn = dev.new_buffer(ffn as u64 * buf_b * 4);
+            let yb_kv = dev.new_buffer(kv_dim as u64 * buf_b * 4);
+            let yb_vocab = dev.new_buffer(vocab as u64 * buf_b * 4);
+            let p_bm_q6k = dev.new_compute_pipeline(
+                &batch_lib.get_function("matmul_q6k").unwrap()).unwrap();
+
+            let gb = ((b + nb - 1) / nb) as u64; // NB-aware grid Y
+            bench(&format!("full forward sim B={b} (matmuls only, 1 enc)"), ITERS / 5, &queue, |enc| {
+                for _ in 0..n_layers {
+                    // Q: [2048×2048]×B
+                    enc.set_pipeline(&p_bm_q4_0);
+                    enc.set_buffer(0, &w_q4_0_2048x2048, 0);
+                    enc.set_buffer(1, &xb, 0);
+                    enc.set_buffer(2, &yb, 0);
+                    enc.set_bytes(3, &hidden as *const u32 as *const c_void, 4);
+                    let q_rows = q_dim;
+                    enc.set_bytes(4, &q_rows as *const u32 as *const c_void, 4);
+                    enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((q_rows+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // K: [512×2048]×B
+                    let kv_r = kv_dim;
+                    enc.set_buffer(2, &yb_kv, 0);
+                    enc.set_bytes(4, &kv_r as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((kv_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // V: [512×2048]×B
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((kv_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // O: [2048×2048]×B
+                    enc.set_buffer(2, &yb, 0);
+                    let h_r = hidden;
+                    enc.set_bytes(4, &h_r as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((h_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // gate: [8192×2048]×B
+                    enc.set_buffer(0, &w_q4_0_8192x2048, 0);
+                    enc.set_buffer(2, &yb_ffn, 0);
+                    let ffn_r = ffn;
+                    enc.set_bytes(4, &ffn_r as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((ffn_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // up: [8192×2048]×B
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((ffn_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // down: [2048×8192]×B
+                    enc.set_buffer(0, &w_q4_0_2048x8192, 0);
+                    enc.set_buffer(2, &yb, 0);
+                    let ffn_cols = ffn;
+                    enc.set_bytes(3, &ffn_cols as *const u32 as *const c_void, 4);
+                    enc.set_bytes(4, &h_r as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((h_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // Reset cols for next layer
+                    enc.set_bytes(3, &hidden as *const u32 as *const c_void, 4);
+                }
+                // Output: [128256×2048]×B (Q6K)
+                enc.set_pipeline(&p_bm_q6k);
+                enc.set_buffer(0, &w_q6k_vocab, 0);
+                enc.set_buffer(1, &xb, 0);
+                enc.set_buffer(2, &yb_vocab, 0);
+                enc.set_bytes(3, &hidden as *const u32 as *const c_void, 4);
+                let vocab_r = vocab;
+                enc.set_bytes(4, &vocab_r as *const u32 as *const c_void, 4);
+                enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+                enc.dispatch_threadgroups(
+                    MTLSize::new(((vocab_r+7)/8) as u64, gb, 1),
+                    MTLSize::new(256, 1, 1));
+            });
+        }
+    }
+
+    // ── FP16 Batch Matmul ──
+    eprintln!("\n--- FP16 Batch Matmul (B={}, half accumulators) ---",
+        crate::kernels_batch::BATCH_SIZE);
+    {
+        let batch_src = crate::kernels_batch::all_batch_kernels();
+        let batch_lib = dev.new_library_with_source(&batch_src).unwrap();
+        let p_f16_q4_0 = dev.new_compute_pipeline(
+            &batch_lib.get_function("matmul_q4_0_f16").unwrap()).unwrap();
+        let p_f16_q6k = dev.new_compute_pipeline(
+            &batch_lib.get_function("matmul_q6k_f16").unwrap()).unwrap();
+        let nb = crate::kernels_batch::BATCH_NB;
+        let bs = crate::kernels_batch::BATCH_SIZE;
+
+        // Individual matmul benchmarks (FP16 X/Y buffers = 2 bytes/element)
+        for b in [1u32, 8, 25, 32] {
+            let buf_b = b.max(bs);
+            let x16 = dev.new_buffer(hidden as u64 * buf_b as u64 * 2);
+            let y16 = dev.new_buffer(hidden as u64 * buf_b as u64 * 2);
+            let rows_val = hidden;
+            let cols_val = hidden;
+            bench(&format!("f16 matmul_q4_0 [{hidden}x{hidden}] B={b}"), ITERS, &queue, |enc| {
+                enc.set_pipeline(&p_f16_q4_0);
+                enc.set_buffer(0, &w_q4_0_2048x2048, 0);
+                enc.set_buffer(1, &x16, 0);
+                enc.set_buffer(2, &y16, 0);
+                enc.set_bytes(3, &cols_val as *const u32 as *const c_void, 4);
+                enc.set_bytes(4, &rows_val as *const u32 as *const c_void, 4);
+                enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+                let grid_x = (rows_val + 7) / 8;
+                let grid_y = (b + nb - 1) / nb;
+                enc.dispatch_threadgroups(
+                    MTLSize::new(grid_x as u64, grid_y as u64, 1),
+                    MTLSize::new(256, 1, 1));
+            });
+        }
+
+        // FFN gate: [8192 × 2048] (FP16)
+        for b in [1u32, 25] {
+            let buf_b = b.max(bs);
+            let x16 = dev.new_buffer(hidden as u64 * buf_b as u64 * 2);
+            let y16 = dev.new_buffer(ffn as u64 * buf_b as u64 * 2);
+            let rows_val = ffn;
+            let cols_val = hidden;
+            bench(&format!("f16 matmul_q4_0 [{ffn}x{hidden}] B={b}"), ITERS, &queue, |enc| {
+                enc.set_pipeline(&p_f16_q4_0);
+                enc.set_buffer(0, &w_q4_0_8192x2048, 0);
+                enc.set_buffer(1, &x16, 0);
+                enc.set_buffer(2, &y16, 0);
+                enc.set_bytes(3, &cols_val as *const u32 as *const c_void, 4);
+                enc.set_bytes(4, &rows_val as *const u32 as *const c_void, 4);
+                enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+                let grid_x = (rows_val + 7) / 8;
+                let grid_y = (b + nb - 1) / nb;
+                enc.dispatch_threadgroups(
+                    MTLSize::new(grid_x as u64, grid_y as u64, 1),
+                    MTLSize::new(256, 1, 1));
+            });
+        }
+
+        // Full forward simulation FP16
+        eprintln!("\n--- FP16 Batch Full Forward Simulation ---");
+        for b in [1u32, 8, 25, 32] {
+            let buf_b = b.max(bs) as u64;
+            let max_cols = ffn.max(hidden) as u64;
+            let xb16 = dev.new_buffer(max_cols * buf_b * 2);
+            let yb16 = dev.new_buffer(hidden as u64 * buf_b * 2);
+            let yb16_ffn = dev.new_buffer(ffn as u64 * buf_b * 2);
+            let yb16_kv = dev.new_buffer(kv_dim as u64 * buf_b * 2);
+            let yb16_vocab = dev.new_buffer(vocab as u64 * buf_b * 2);
+
+            let gb = ((b + nb - 1) / nb) as u64;
+            bench(&format!("f16 full forward sim B={b} (matmuls only, 1 enc)"), ITERS / 5, &queue, |enc| {
+                for _ in 0..n_layers {
+                    // Q: [2048×2048]×B
+                    enc.set_pipeline(&p_f16_q4_0);
+                    enc.set_buffer(0, &w_q4_0_2048x2048, 0);
+                    enc.set_buffer(1, &xb16, 0);
+                    enc.set_buffer(2, &yb16, 0);
+                    enc.set_bytes(3, &hidden as *const u32 as *const c_void, 4);
+                    let q_rows = q_dim;
+                    enc.set_bytes(4, &q_rows as *const u32 as *const c_void, 4);
+                    enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((q_rows+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // K: [512×2048]×B
+                    let kv_r = kv_dim;
+                    enc.set_buffer(2, &yb16_kv, 0);
+                    enc.set_bytes(4, &kv_r as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((kv_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // V: [512×2048]×B
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((kv_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // O: [2048×2048]×B
+                    enc.set_buffer(2, &yb16, 0);
+                    let h_r = hidden;
+                    enc.set_bytes(4, &h_r as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((h_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // gate: [8192×2048]×B
+                    enc.set_buffer(0, &w_q4_0_8192x2048, 0);
+                    enc.set_buffer(2, &yb16_ffn, 0);
+                    let ffn_r = ffn;
+                    enc.set_bytes(4, &ffn_r as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((ffn_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // up: [8192×2048]×B
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((ffn_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // down: [2048×8192]×B
+                    enc.set_buffer(0, &w_q4_0_2048x8192, 0);
+                    enc.set_buffer(2, &yb16, 0);
+                    let ffn_cols = ffn;
+                    enc.set_bytes(3, &ffn_cols as *const u32 as *const c_void, 4);
+                    enc.set_bytes(4, &h_r as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((h_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    // Reset cols for next layer
+                    enc.set_bytes(3, &hidden as *const u32 as *const c_void, 4);
+                }
+                // Output: [128256×2048]×B (Q6K FP16)
+                enc.set_pipeline(&p_f16_q6k);
+                enc.set_buffer(0, &w_q6k_vocab, 0);
+                enc.set_buffer(1, &xb16, 0);
+                enc.set_buffer(2, &yb16_vocab, 0);
+                enc.set_bytes(3, &hidden as *const u32 as *const c_void, 4);
+                let vocab_r = vocab;
+                enc.set_bytes(4, &vocab_r as *const u32 as *const c_void, 4);
+                enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+                enc.dispatch_threadgroups(
+                    MTLSize::new(((vocab_r+7)/8) as u64, gb, 1),
+                    MTLSize::new(256, 1, 1));
+            });
+        }
+    }
+
+    // ── FP16 N-scaling: test register pressure limits ──
+    eprintln!("\n--- FP16 N-Scaling (half accumulators, [2048x2048]) ---");
+    {
+        let batch_src = crate::kernels_batch::all_batch_kernels();
+        let batch_lib = dev.new_library_with_source(&batch_src).unwrap();
+        let nb = crate::kernels_batch::BATCH_NB;
+
+        for &n in &[25u32, 32, 50, 64, 100] {
+            let name = if n == 25 { "matmul_q4_0_f16".to_string() }
+                       else { format!("matmul_q4_0_f16_n{n}") };
+            let pipe = dev.new_compute_pipeline(
+                &batch_lib.get_function(&name).unwrap()).unwrap();
+            let x16 = dev.new_buffer(hidden as u64 * n as u64 * 2);
+            let y16 = dev.new_buffer(hidden as u64 * n as u64 * 2);
+            let rows_val = hidden;
+            let cols_val = hidden;
+            bench(&format!("f16 [2048x2048] N={n} (B={n})"), ITERS, &queue, |enc| {
+                enc.set_pipeline(&pipe);
+                enc.set_buffer(0, &w_q4_0_2048x2048, 0);
+                enc.set_buffer(1, &x16, 0);
+                enc.set_buffer(2, &y16, 0);
+                enc.set_bytes(3, &cols_val as *const u32 as *const c_void, 4);
+                enc.set_bytes(4, &rows_val as *const u32 as *const c_void, 4);
+                enc.set_bytes(5, &n as *const u32 as *const c_void, 4);
+                let grid_x = (rows_val + 7) / 8;
+                let grid_y = (n + nb - 1) / nb;
+                enc.dispatch_threadgroups(
+                    MTLSize::new(grid_x as u64, grid_y as u64, 1),
+                    MTLSize::new(256, 1, 1));
+            });
+        }
+
+        // Full forward sim with best N
+        eprintln!("\n--- FP16 N-Scaling Full Forward ---");
+        for &n in &[25u32, 32, 50, 64, 100] {
+            let name = if n == 25 { "matmul_q4_0_f16".to_string() }
+                       else { format!("matmul_q4_0_f16_n{n}") };
+            let pipe = dev.new_compute_pipeline(
+                &batch_lib.get_function(&name).unwrap()).unwrap();
+            let p_f16_q6k = dev.new_compute_pipeline(
+                &batch_lib.get_function("matmul_q6k_f16").unwrap()).unwrap();
+            let max_cols = ffn.max(hidden) as u64;
+            let xb16 = dev.new_buffer(max_cols * n as u64 * 2);
+            let yb16 = dev.new_buffer(hidden as u64 * n as u64 * 2);
+            let yb16_ffn = dev.new_buffer(ffn as u64 * n as u64 * 2);
+            let yb16_kv = dev.new_buffer(kv_dim as u64 * n as u64 * 2);
+            let yb16_vocab = dev.new_buffer(vocab as u64 * n as u64 * 2);
+            let gb = ((n + nb - 1) / nb) as u64;
+            let b = n;
+            bench(&format!("f16 full fwd N={n} B={n}"), ITERS / 5, &queue, |enc| {
+                for _ in 0..n_layers {
+                    enc.set_pipeline(&pipe);
+                    enc.set_buffer(0, &w_q4_0_2048x2048, 0);
+                    enc.set_buffer(1, &xb16, 0);
+                    enc.set_buffer(2, &yb16, 0);
+                    enc.set_bytes(3, &hidden as *const u32 as *const c_void, 4);
+                    let q_rows = q_dim;
+                    enc.set_bytes(4, &q_rows as *const u32 as *const c_void, 4);
+                    enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((q_rows+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    let kv_r = kv_dim;
+                    enc.set_buffer(2, &yb16_kv, 0);
+                    enc.set_bytes(4, &kv_r as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((kv_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((kv_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    enc.set_buffer(2, &yb16, 0);
+                    let h_r = hidden;
+                    enc.set_bytes(4, &h_r as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((h_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    enc.set_buffer(0, &w_q4_0_8192x2048, 0);
+                    enc.set_buffer(2, &yb16_ffn, 0);
+                    let ffn_r = ffn;
+                    enc.set_bytes(4, &ffn_r as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((ffn_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((ffn_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    enc.set_buffer(0, &w_q4_0_2048x8192, 0);
+                    enc.set_buffer(2, &yb16, 0);
+                    let ffn_cols = ffn;
+                    enc.set_bytes(3, &ffn_cols as *const u32 as *const c_void, 4);
+                    enc.set_bytes(4, &h_r as *const u32 as *const c_void, 4);
+                    enc.dispatch_threadgroups(
+                        MTLSize::new(((h_r+7)/8) as u64, gb, 1),
+                        MTLSize::new(256, 1, 1));
+                    enc.set_bytes(3, &hidden as *const u32 as *const c_void, 4);
+                }
+                enc.set_pipeline(&p_f16_q6k);
+                enc.set_buffer(0, &w_q6k_vocab, 0);
+                enc.set_buffer(1, &xb16, 0);
+                enc.set_buffer(2, &yb16_vocab, 0);
+                enc.set_bytes(3, &hidden as *const u32 as *const c_void, 4);
+                let vocab_r = vocab;
+                enc.set_bytes(4, &vocab_r as *const u32 as *const c_void, 4);
+                enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+                enc.dispatch_threadgroups(
+                    MTLSize::new(((vocab_r+7)/8) as u64, gb, 1),
+                    MTLSize::new(256, 1, 1));
             });
         }
     }

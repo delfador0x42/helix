@@ -16,6 +16,7 @@ mod infer;
 mod bench_dispatch;
 mod bench_kernels;
 mod kernels_batch;
+mod infer_batch;
 
 use std::path::{Path, PathBuf};
 
@@ -31,6 +32,8 @@ fn main() {
         "generate" => run_generate(args.get(2)),
         "bench-dispatch" => bench_dispatch::run(),
         "bench-kernels" => bench_kernels::run(),
+        "bench-batch" => run_bench_batch(args.get(2)),
+        "generate-batch" => run_generate_batch(args.get(2)),
         _ => usage(),
     }
 }
@@ -43,6 +46,8 @@ fn usage() -> ! {
     eprintln!("  helix-bg metal-test         Benchmark Metal GPU bandwidth + matmul");
     eprintln!("  helix-bg load-model [path]  Load and inspect a GGUF model file");
     eprintln!("  helix-bg generate [path]    Generate tokens from GGUF model");
+    eprintln!("  helix-bg bench-batch [path] Benchmark batch forward pass (FP16)");
+    eprintln!("  helix-bg generate-batch [path] Generate text using batch prefill + decode");
     std::process::exit(1);
 }
 
@@ -333,6 +338,175 @@ fn run_generate(path_arg: Option<&String>) {
         }
     }).collect();
     eprintln!("\nDecoded:\n{text}");
+}
+
+fn run_bench_batch(path_arg: Option<&String>) {
+    let path = path_arg.map(|s| std::path::PathBuf::from(s)).unwrap_or_else(|| {
+        let mut p = std::env::current_dir().unwrap_or_default();
+        p.push("models");
+        if let Ok(entries) = std::fs::read_dir(&p) {
+            for e in entries.flatten() {
+                if e.path().extension().map(|x| x == "gguf").unwrap_or(false) {
+                    return e.path();
+                }
+            }
+        }
+        eprintln!("No .gguf file found. Pass path as argument.");
+        std::process::exit(1);
+    });
+    eprintln!("Loading GGUF: {}", path.display());
+    let gguf = gguf::GGUFFile::open(&path).unwrap_or_else(|e| fatal(&e));
+    let mdl = model::Model::load(&gguf).unwrap_or_else(|e| fatal(&e));
+    let batch = infer_batch::BatchState::new(&mdl).unwrap_or_else(|e| fatal(&e));
+    let bs = batch.batch_size;
+
+    eprintln!("\n=== Batch Forward Benchmark (B={}, FP16) ===\n", bs);
+
+    let bos = gguf.config.bos_token;
+    let tokens: Vec<u32> = vec![bos; bs as usize];
+
+    // Warmup
+    for _ in 0..3 {
+        infer_batch::forward_batch(&mdl, &batch, &tokens, 0);
+    }
+
+    let iters = 20u32;
+
+    // Benchmark: advancing positions (realistic — attention grows)
+    let t0 = std::time::Instant::now();
+    for i in 0..iters {
+        infer_batch::forward_batch(&mdl, &batch, &tokens, i * bs);
+    }
+    let per_iter = t0.elapsed().as_secs_f64() / iters as f64;
+    let tok_per_sec = bs as f64 / per_iter;
+    eprintln!("  Batch (advancing pos): {:.2}ms = {:.0} tok/s", per_iter * 1000.0, tok_per_sec);
+
+    // Benchmark: fixed pos=0 (isolates element-wise overhead)
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        infer_batch::forward_batch(&mdl, &batch, &tokens, 0);
+    }
+    let fixed_per = t0.elapsed().as_secs_f64() / iters as f64;
+    let fixed_tps = bs as f64 / fixed_per;
+    eprintln!("  Batch (pos=0 fixed):   {:.2}ms = {:.0} tok/s", fixed_per * 1000.0, fixed_tps);
+
+    // Single-token comparison
+    for _ in 0..3 { infer::forward(&mdl, bos, 0); }
+    let t0 = std::time::Instant::now();
+    for i in 0..iters { infer::forward(&mdl, bos, i); }
+    let single_per = t0.elapsed().as_secs_f64() / iters as f64;
+    eprintln!("  Single-token:          {:.2}ms = {:.0} tok/s", single_per * 1000.0, 1.0 / single_per);
+    eprintln!("  Batch speedup: {:.1}x", tok_per_sec * single_per);
+
+    // Correctness check: compare batch[0] vs single-token at pos=0
+    eprintln!("\n  --- Correctness check (pos=0) ---");
+    infer::forward(&mdl, bos, 0);
+    let single_argmax = infer::argmax(&mdl);
+    infer_batch::forward_batch(&mdl, &batch, &tokens, 0);
+    let batch_results = infer_batch::argmax_batch(&batch);
+    if single_argmax == batch_results[0] {
+        eprintln!("  MATCH: single={}, batch[0]={}", single_argmax, batch_results[0]);
+    } else {
+        eprintln!("  MISMATCH: single={}, batch[0]={}", single_argmax, batch_results[0]);
+    }
+
+    eprintln!("\n=== Done ===");
+}
+
+fn run_generate_batch(path_arg: Option<&String>) {
+    let path = path_arg.map(|s| std::path::PathBuf::from(s)).unwrap_or_else(|| {
+        let mut p = std::env::current_dir().unwrap_or_default();
+        p.push("models");
+        if let Ok(entries) = std::fs::read_dir(&p) {
+            for e in entries.flatten() {
+                if e.path().extension().map(|x| x == "gguf").unwrap_or(false) {
+                    return e.path();
+                }
+            }
+        }
+        eprintln!("No .gguf file found. Pass path as argument.");
+        std::process::exit(1);
+    });
+    eprintln!("Loading GGUF: {}", path.display());
+    let gguf = gguf::GGUFFile::open(&path).unwrap_or_else(|e| fatal(&e));
+
+    // Extract vocab for decoding
+    let vocab: Vec<String> = gguf.metadata.get("tokenizer.ggml.tokens")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| {
+            if let gguf::MetaValue::Str(s) = v { Some(s.clone()) } else { None }
+        }).collect())
+        .unwrap_or_default();
+
+    let mdl = model::Model::load(&gguf).unwrap_or_else(|e| fatal(&e));
+    let batch = infer_batch::BatchState::new(&mdl).unwrap_or_else(|e| fatal(&e));
+
+    let bos = gguf.config.bos_token;
+    let eos = gguf.config.eos_token;
+
+    // Simulate a prompt: BOS + repeated tokens (for prefill benchmark)
+    let prompt_len = 200u32;
+    let prompt: Vec<u32> = std::iter::once(bos)
+        .chain(std::iter::repeat(bos).take(prompt_len as usize - 1))
+        .collect();
+    let n_generate = 128u32;
+
+    eprintln!("\n=== Batch Generate (prompt={}, generate={}, B={}) ===\n",
+        prompt_len, n_generate, batch.batch_size);
+
+    // ── Prefill benchmark ──
+    let t0 = std::time::Instant::now();
+    let pos = infer_batch::prefill(&mdl, &batch, &prompt);
+    let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let prefill_tps = prompt_len as f64 / t0.elapsed().as_secs_f64();
+    eprintln!("  Prefill: {} tokens in {:.2}ms = {:.0} tok/s",
+        prompt_len, prefill_ms, prefill_tps);
+
+    // ── Decode benchmark ──
+    let first_token = infer_batch::argmax_one(&batch);
+    let t1 = std::time::Instant::now();
+    let mut generated = vec![first_token];
+    let mut next = first_token;
+    for i in 0..n_generate - 1 {
+        next = infer_batch::decode_step(&mdl, &batch, next, pos + i);
+        generated.push(next);
+        if next == eos { break; }
+    }
+    let decode_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let decode_tps = generated.len() as f64 / t1.elapsed().as_secs_f64();
+    eprintln!("  Decode:  {} tokens in {:.2}ms = {:.0} tok/s",
+        generated.len(), decode_ms, decode_tps);
+
+    // Decode tokens to text
+    let text: String = generated.iter().map(|&t| {
+        if (t as usize) < vocab.len() {
+            vocab[t as usize].replace("Ġ", " ").replace("Ċ", "\n")
+        } else {
+            format!("[{t}]")
+        }
+    }).collect();
+    eprintln!("\n  Generated text:\n{text}");
+
+    // ── Single-token comparison ──
+    eprintln!("\n  --- Single-token decode comparison ---");
+    let t2 = std::time::Instant::now();
+    let mut single_tok = bos;
+    for p in 0..prompt_len {
+        infer::forward(&mdl, single_tok, p);
+        single_tok = infer::argmax(&mdl);
+    }
+    for _ in 0..n_generate - 1 {
+        infer::forward(&mdl, single_tok, prompt_len);
+        single_tok = infer::argmax(&mdl);
+    }
+    let single_ms = t2.elapsed().as_secs_f64() * 1000.0;
+    let single_total = prompt_len + n_generate - 1;
+    let single_tps = single_total as f64 / t2.elapsed().as_secs_f64();
+    eprintln!("  Single:  {} tokens in {:.2}ms = {:.0} tok/s",
+        single_total, single_ms, single_tps);
+    eprintln!("  Prefill speedup: {:.1}x", prefill_tps / single_tps);
+
+    eprintln!("\n=== Done ===");
 }
 
 fn fatal(msg: &str) -> ! {
