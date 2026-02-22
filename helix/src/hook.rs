@@ -218,11 +218,14 @@ fn ambient(input: &str, dir: &Path) -> Result<String, String> {
 
 // ══════════ Hook: PostToolUse (Build) ══════════
 
-/// After build commands: auto-capture errors, search KB, track fix-pairs.
+/// After Bash commands: auto-capture build errors, benchmark timings, perf data.
 fn post_build(input: &str, dir: &Path) -> Result<String, String> {
     let is_build = (input.contains("xcodebuild") && input.contains("build"))
         || input.contains("cargo build") || input.contains("swift build")
         || input.contains("swiftc ");
+    // Also check for benchmark/timing output even on non-build commands
+    let response = extract_json_str(input, "tool_response").unwrap_or(input);
+    capture_benchmark(response, dir);
     if !is_build { return Ok(String::new()); }
 
     let has_error = input.contains("error:") || input.contains("error[E")
@@ -311,6 +314,59 @@ fn post_build(input: &str, dir: &Path) -> Result<String, String> {
         session.save();
         Ok(String::new())
     }
+}
+
+// ══════════ Benchmark Auto-Capture ══════════
+
+/// Detect and store benchmark/timing data from Bash output.
+/// Looks for labeled timing patterns like "name: 123.45ms" or "name: 1.23µs"
+/// and throughput patterns like "123.4 tok/s" or "350 GB/s".
+fn capture_benchmark(response: &str, dir: &Path) {
+    let mut timings: Vec<String> = Vec::new();
+    // Scan for timing patterns in each line (split on real newlines and JSON-escaped newlines)
+    for part in response.split("\\n").flat_map(|s| s.split('\n')) {
+        let t = part.trim();
+        if t.is_empty() || t.len() < 5 { continue; }
+        // Skip build output lines, errors, and pure log lines
+        if t.contains(": error:") || t.contains("warning:") || t.starts_with("Compiling")
+            || t.starts_with("Linking") || t.starts_with("Finished") { continue; }
+        // Match timing patterns: digits followed by ms/µs/us/ns
+        let has_timing = has_timing_pattern(t);
+        // Match throughput patterns: digits followed by tok/s, GB/s, MB/s
+        let has_throughput = t.contains("tok/s") || t.contains("GB/s") || t.contains("MB/s")
+            || t.contains("tokens/s") || t.contains("it/s");
+        if has_timing || has_throughput {
+            timings.push(crate::text::truncate(t, 150).to_string());
+            if timings.len() >= 20 { break; }
+        }
+    }
+    if timings.len() < 2 { return; } // Need at least 2 timing lines to be a benchmark
+    let text = timings.join("\n");
+    auto_store(dir, "perf-data", &text, "auto, benchmark, performance");
+}
+
+/// Check if a string contains a timing pattern like "123.45ms" or "1.23µs".
+fn has_timing_pattern(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    for i in 0..len {
+        if !bytes[i].is_ascii_digit() { continue; }
+        // Find the end of the number (digits and dots)
+        let mut j = i + 1;
+        while j < len && (bytes[j].is_ascii_digit() || bytes[j] == b'.') { j += 1; }
+        if j >= len || j == i + 1 { continue; }
+        // Check suffix: ms, µs, us, ns, s (but not just any 's')
+        let rest = &s[j..];
+        if rest.starts_with("ms") || rest.starts_with("µs") || rest.starts_with("us")
+            || rest.starts_with("ns") {
+            return true;
+        }
+        // Bare "s" only if preceded by a decimal point (e.g. "3.15s" but not "32s")
+        if rest.starts_with('s') && !rest.get(1..2).map(|c| c.as_bytes()[0].is_ascii_alphanumeric()).unwrap_or(false) {
+            if s[i..j].contains('.') { return true; }
+        }
+    }
+    false
 }
 
 // ══════════ Hook: PostToolUseFailure (Error Context) ══════════
@@ -498,12 +554,13 @@ pub fn extract_removed_syms(input: &crate::json::Value, stem: &str) -> Vec<Strin
     removed
 }
 
-/// 5-layer smart ambient context with deduplication:
+/// 6-layer smart ambient context with deduplication:
 ///   1. Source-path matches — entries with [source:] metadata for this file
 ///   2. Symbol-based OR search — fn/struct/enum names from file (cached)
 ///   3. Global BM25 — stem keyword search
 ///   4. Structural coupling — "structural <stem>" query
-///   5. Refactor impact — removed symbols (Edit only)
+///   5. Refactor impact — removed symbols (Edit only, KB search)
+///   6. Code blast radius — removed symbols (Edit only, codegraph usages)
 ///
 /// Adaptive: Layer 2 skipped when Layer 1 returns 5+ hits.
 /// Cow<str>: Layer 1 borrows from mmap (zero alloc), other layers own.
@@ -576,7 +633,7 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], se
     }
     let l4 = pool.len() - l4_start;
 
-    // Layer 5: Refactor impact (Edit only)
+    // Layer 5: Refactor impact (Edit only, KB search)
     let l5_start = pool.len();
     for sym in syms {
         for hit in idx_search(data, sym, 3) {
@@ -584,6 +641,43 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], se
         }
     }
     let l5 = pool.len() - l5_start;
+
+    // Layer 6: Code blast radius (Edit only, codegraph)
+    // When symbols are removed, find code files that reference them.
+    let mut code_blast: Vec<String> = Vec::new();
+    if !syms.is_empty() {
+        if let Some(root) = find_project_root(file_path) {
+            let files = crate::codegraph::walk_source_files(&root);
+            for sym in syms {
+                let usages = crate::codegraph::find_usages(&root, &files, sym, "", 0);
+                if usages.is_empty() { continue; }
+                let mut line = String::with_capacity(64);
+                line.push_str(sym);
+                line.push_str(" → ");
+                crate::text::itoa_push(&mut line, usages.len() as u32);
+                line.push_str(" refs: ");
+                let mut shown_files = crate::fxhash::FxHashSet::default();
+                let mut count = 0;
+                for u in &usages {
+                    if count >= 3 { break; }
+                    if shown_files.insert(u.file.as_str()) {
+                        if count > 0 { line.push_str(", "); }
+                        line.push_str(&u.file);
+                        line.push(':');
+                        crate::text::itoa_push(&mut line, u.line);
+                        count += 1;
+                    }
+                }
+                if usages.len() > 3 {
+                    line.push_str(" +");
+                    crate::text::itoa_push(&mut line, (usages.len() - 3) as u32);
+                    line.push_str(" more");
+                }
+                code_blast.push(line);
+            }
+        }
+    }
+    let l6 = code_blast.len();
 
     // Directory fallback: when file stem is unknown to KB, try parent dir name.
     // Catches new files in known directories (e.g. new probe in Scanners/).
@@ -625,7 +719,8 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], se
     }
 
     // Single output pass
-    let est = pool.iter().map(|s| s.len() + 4).sum::<usize>() + 5 * 40;
+    let est = pool.iter().map(|s| s.len() + 4).sum::<usize>() + 6 * 40
+        + code_blast.iter().map(|s| s.len() + 4).sum::<usize>();
     let mut out = String::with_capacity(est);
     let counts = [l1, l2, l3, l4, l5];
     let mut pool_idx = 0;
@@ -652,6 +747,14 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], se
             pool_idx += 1;
         }
     }
+    // Layer 6: Code blast radius (separate from KB pool)
+    if l6 > 0 {
+        if !out.is_empty() { out.push_str("---\n"); }
+        out.push_str("CODE BLAST RADIUS (callers/references that may break):\n");
+        for line in &code_blast {
+            out.push_str("  "); out.push_str(line); out.push('\n');
+        }
+    }
     // Directory fallback entries (after L1-L5)
     if pool_idx < pool.len() {
         let dir_name = std::path::Path::new(file_path).parent()
@@ -664,6 +767,21 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], se
         }
     }
     out
+}
+
+// ══════════ Project Root Detection (for Layer 6) ══════════
+
+/// Walk up from a file path to find the project root (Cargo.toml, Package.swift, .git, etc.)
+fn find_project_root(file_path: &str) -> Option<std::path::PathBuf> {
+    let markers = ["Cargo.toml", "Package.swift", ".git", "Makefile", "build.rs"];
+    let mut dir = std::path::Path::new(file_path).parent()?;
+    for _ in 0..8 {
+        for m in &markers {
+            if dir.join(m).exists() { return Some(dir.to_path_buf()); }
+        }
+        dir = dir.parent()?;
+    }
+    None
 }
 
 // ══════════ Symbol Extraction (for Layer 2) ══════════

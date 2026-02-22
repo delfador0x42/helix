@@ -15,6 +15,7 @@ mod mcp;
 mod session;
 mod hook;
 mod sock;
+mod codegraph;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

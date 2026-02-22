@@ -288,6 +288,7 @@ pub fn dispatch(name: &str, args: Option<&Value>, dir: &Path) -> Result<String, 
         }
         "edit" => dispatch_edit(args, dir),
         "topics" => dispatch_topics(args, dir),
+        "trace" => dispatch_trace(args),
         _ => Err(format!("unknown tool: {name}")),
     }
 }
@@ -694,6 +695,101 @@ fn dispatch_topics(args: Option<&Value>, dir: &Path) -> Result<String, String> {
     }
 }
 
+fn dispatch_trace(args: Option<&Value>) -> Result<String, String> {
+    let action = arg(args, "action");
+    let path_str = arg(args, "path");
+    if path_str.is_empty() { return Err("path required (project directory or file)".into()); }
+    let path = std::path::PathBuf::from(path_str);
+    if !path.exists() { return Err(format!("path not found: {path_str}")); }
+    match action {
+        "symbols" => {
+            if path.is_file() {
+                let root = path.parent().unwrap_or(&path);
+                Ok(crate::codegraph::file_symbols(root, &path))
+            } else {
+                let files = crate::codegraph::walk_source_files(&path);
+                let mut out = String::with_capacity(1024);
+                let mut total = 0;
+                for file in &files {
+                    let content = match std::fs::read_to_string(file) { Ok(c) => c, Err(_) => continue };
+                    let rel = file.strip_prefix(&path).unwrap_or(file).to_string_lossy();
+                    let syms = crate::codegraph::extract_symbols(&content, &rel);
+                    if !syms.is_empty() {
+                        use std::fmt::Write;
+                        let _ = writeln!(out, "{rel} ({} symbols):", syms.len());
+                        for s in &syms {
+                            let _ = writeln!(out, "  {} {} :{}  {}", s.kind, s.name, s.line, s.signature);
+                            total += 1;
+                        }
+                    }
+                }
+                use std::fmt::Write;
+                let _ = writeln!(out, "\n{total} symbols in {} files", files.len());
+                Ok(out)
+            }
+        }
+        "blast" => {
+            if path.is_file() {
+                let root = path.parent().unwrap_or(&path);
+                Ok(crate::codegraph::blast_radius(root, &path))
+            } else {
+                Err("blast requires a file path, not a directory".into())
+            }
+        }
+        "analyze" => {
+            // Deep project analysis: module map, coupling, patterns, deps
+            // Stores results in KB under topic 'code-<dirname>'
+            if !path.is_dir() { return Err("analyze requires a project directory".into()); }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("project");
+            let analysis = crate::codegraph::analyze_project(&path);
+            let entries = crate::codegraph::format_analysis(&analysis, name);
+            // Store each entry in the KB
+            let dir = crate::config::resolve_dir(None);
+            let topic = format!("code-{}", crate::config::sanitize_topic(name));
+            let mut out = String::with_capacity(512);
+            let mut stored = 0;
+            for (label, text) in &entries {
+                match crate::write::store(&dir, &topic, text, Some(&format!("auto, code-analysis, {label}")),
+                    true, None, Some(0.8), None) {
+                    Ok(_) => { stored += 1; }
+                    Err(e) => { out.push_str("warn: "); out.push_str(&e); out.push('\n'); }
+                }
+            }
+            std::fs::write("/tmp/helix-external-write", b"1").ok();
+            out.push_str("Analyzed ");
+            out.push_str(name);
+            out.push_str(": ");
+            crate::text::itoa_push(&mut out, analysis.files.len() as u32);
+            out.push_str(" files, ");
+            let total_syms: usize = analysis.files.iter().map(|f| f.symbols.len()).sum();
+            crate::text::itoa_push(&mut out, total_syms as u32);
+            out.push_str(" symbols, ");
+            let total_pats: usize = analysis.files.iter().map(|f| f.patterns.len()).sum();
+            crate::text::itoa_push(&mut out, total_pats as u32);
+            out.push_str(" patterns, ");
+            crate::text::itoa_push(&mut out, analysis.coupling.len() as u32);
+            out.push_str(" coupling pairs. Stored ");
+            crate::text::itoa_push(&mut out, stored as u32);
+            out.push_str(" entries in topic '");
+            out.push_str(&topic);
+            out.push_str("'.\n\n");
+            // Include the analysis text directly in the response too
+            for (_, text) in &entries {
+                out.push_str(text);
+                out.push('\n');
+            }
+            Ok(out)
+        }
+        _ => {
+            // Default: trace a symbol
+            let symbol = arg(args, "symbol");
+            if symbol.is_empty() { return Err("symbol required (function/struct/enum name to trace)".into()); }
+            let root = if path.is_file() { path.parent().unwrap_or(&path).to_path_buf() } else { path };
+            Ok(crate::codegraph::trace_symbol(&root, symbol))
+        }
+    }
+}
+
 // ══════════ Helpers ══════════
 
 fn log_preview(body: &str) -> &str {
@@ -850,6 +946,11 @@ fn tool_list() -> Value {
               ("hypotheses", "string", "Semicolon-separated working hypotheses for checkpoint"),
               ("blocked", "string", "What's blocking progress for checkpoint"),
               ("files", "string", "Comma-separated key files for checkpoint")]),
+        tool("trace", "Code structure analyzer with deep semantic analysis. Actions: 'symbols' (list all symbols in a file/dir), 'blast' (show all external refs for a file), 'analyze' (deep project analysis: module map, symbol index, coupling matrix, pattern inventory, dependency graph — stores results in KB for nanosecond access via ambient hook), default (trace a specific symbol — find definition + all call sites).",
+            &["path"],
+            &[("path", "string", "Project directory or file path to analyze"),
+              ("symbol", "string", "Symbol name to trace (function, struct, enum, trait, class). Required for default action."),
+              ("action", "string", "Operation: 'symbols' (list definitions), 'blast' (blast radius for a file), 'analyze' (deep project analysis + store in KB), or omit for symbol trace")]),
         tool("_reload", "Re-exec the server binary to pick up code changes.", &[], &[]),
     ])
 }
