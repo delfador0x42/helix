@@ -235,7 +235,12 @@ pub fn extract_tags(lines: &[impl AsRef<str>]) -> Option<String> {
         if let Some(inner) = line.as_ref().strip_prefix("[tags: ").and_then(|s| s.strip_suffix(']')) {
             let tags: Vec<&str> = inner.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
             if !tags.is_empty() {
-                return Some(tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "));
+                let mut out = String::with_capacity(tags.len() * 12);
+                for (i, t) in tags.iter().enumerate() {
+                    if i > 0 { out.push(' '); }
+                    out.push('#'); out.push_str(t);
+                }
+                return Some(out);
             }
         }
     }
@@ -245,6 +250,15 @@ pub fn extract_tags(lines: &[impl AsRef<str>]) -> Option<String> {
 pub fn itoa_push(buf: &mut String, n: u32) {
     if n == 0 { buf.push('0'); return; }
     let mut digits = [0u8; 10];
+    let mut i = 0;
+    let mut v = n;
+    while v > 0 { digits[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
+    while i > 0 { i -= 1; buf.push(digits[i] as char); }
+}
+
+pub fn itoa_push_u64(buf: &mut String, n: u64) {
+    if n == 0 { buf.push('0'); return; }
+    let mut digits = [0u8; 20];
     let mut i = 0;
     let mut v = n;
     while v > 0 { digits[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }

@@ -25,6 +25,7 @@ pub struct Session {
     pub files_touched: u32,
     pub files_edited: u32,
     pub injected: crate::fxhash::FxHashSet<u32>,
+    pub analyzed_projects: Vec<String>, // projects with code analysis injected this session
     pub last_build_ok: Option<bool>,
     pub last_build_t: u64,
 }
@@ -54,6 +55,7 @@ impl Session {
             focus_topics: Vec::new(), phase: Phase::Unknown,
             files_touched: 0, files_edited: 0,
             injected: crate::fxhash::FxHashSet::default(),
+            analyzed_projects: Vec::new(),
             last_build_ok: None, last_build_t: 0,
         }
     }
@@ -101,6 +103,15 @@ impl Session {
         self.phase = if ok { Phase::Verify } else { Phase::Debug };
     }
 
+    pub fn project_analyzed(&self, name: &str) -> bool {
+        self.analyzed_projects.iter().any(|p| p == name)
+    }
+    pub fn mark_project_analyzed(&mut self, name: &str) {
+        if !self.project_analyzed(name) {
+            self.analyzed_projects.push(name.to_string());
+        }
+    }
+
     pub fn add_focus_topic(&mut self, topic: &str) {
         if !self.focus_topics.iter().any(|t| t == topic) {
             self.focus_topics.push(topic.to_string());
@@ -131,16 +142,16 @@ impl Session {
     fn to_json(&self) -> String {
         let mut b = String::with_capacity(512);
         b.push_str("{\"id\":\""); crate::json::escape_into(&self.id, &mut b);
-        b.push_str("\",\"started\":"); push_u64(&mut b, self.started);
-        b.push_str(",\"last_active\":"); push_u64(&mut b, self.last_active);
+        b.push_str("\",\"started\":"); crate::text::itoa_push_u64(&mut b, self.started);
+        b.push_str(",\"last_active\":"); crate::text::itoa_push_u64(&mut b, self.last_active);
         b.push_str(",\"focus\":[");
         for (i, t) in self.focus_topics.iter().enumerate() {
             if i > 0 { b.push(','); }
             b.push('"'); crate::json::escape_into(t, &mut b); b.push('"');
         }
         b.push_str("],\"phase\":\""); b.push_str(self.phase.as_str());
-        b.push_str("\",\"files_touched\":"); push_u64(&mut b, self.files_touched as u64);
-        b.push_str(",\"files_edited\":"); push_u64(&mut b, self.files_edited as u64);
+        b.push_str("\",\"files_touched\":"); crate::text::itoa_push_u64(&mut b, self.files_touched as u64);
+        b.push_str(",\"files_edited\":"); crate::text::itoa_push_u64(&mut b, self.files_edited as u64);
         b.push_str(",\"injected\":[");
         let mut sorted: Vec<u32> = self.injected.iter().copied().collect();
         sorted.sort_unstable();
@@ -148,13 +159,18 @@ impl Session {
             if i > 0 { b.push(','); }
             crate::text::itoa_push(&mut b, *id);
         }
+        b.push_str("],\"analyzed\":[");
+        for (i, p) in self.analyzed_projects.iter().enumerate() {
+            if i > 0 { b.push(','); }
+            b.push('"'); crate::json::escape_into(p, &mut b); b.push('"');
+        }
         b.push_str("],\"build_ok\":");
         match self.last_build_ok {
             None => b.push_str("null"),
             Some(true) => b.push_str("true"),
             Some(false) => b.push_str("false"),
         }
-        b.push_str(",\"build_t\":"); push_u64(&mut b, self.last_build_t);
+        b.push_str(",\"build_t\":"); crate::text::itoa_push_u64(&mut b, self.last_build_t);
         b.push_str("}\n");
         b
     }
@@ -182,6 +198,12 @@ impl Session {
             _ => crate::fxhash::FxHashSet::default(),
         };
 
+        let analyzed_projects = match val.get("analyzed") {
+            Some(crate::json::Value::Arr(arr)) =>
+                arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+            _ => Vec::new(),
+        };
+
         let last_build_ok = match val.get("build_ok") {
             Some(crate::json::Value::Bool(b)) => Some(*b),
             _ => None,
@@ -190,7 +212,7 @@ impl Session {
 
         Some(Session {
             id, started, last_active, focus_topics, phase,
-            files_touched, files_edited, injected,
+            files_touched, files_edited, injected, analyzed_projects,
             last_build_ok, last_build_t,
         })
     }
@@ -211,15 +233,6 @@ impl Phase {
             _ => Phase::Unknown,
         }
     }
-}
-
-fn push_u64(buf: &mut String, n: u64) {
-    if n == 0 { buf.push('0'); return; }
-    let mut digits = [0u8; 20];
-    let mut i = 0;
-    let mut v = n;
-    while v > 0 { digits[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
-    while i > 0 { i -= 1; buf.push(digits[i] as char); }
 }
 
 // ── Checkpoint: durable "where I left off" that survives across sessions ──
@@ -278,11 +291,11 @@ impl Checkpoint {
         let hours = age / 3600;
         let mins = (age % 3600) / 60;
         if hours > 0 {
-            out.push_str("_saved "); push_u64(&mut out, hours);
-            out.push_str("h "); push_u64(&mut out, mins);
+            out.push_str("_saved "); crate::text::itoa_push_u64(&mut out, hours);
+            out.push_str("h "); crate::text::itoa_push_u64(&mut out, mins);
             out.push_str("m ago_\n");
         } else {
-            out.push_str("_saved "); push_u64(&mut out, mins);
+            out.push_str("_saved "); crate::text::itoa_push_u64(&mut out, mins);
             out.push_str("m ago_\n");
         }
 
@@ -317,7 +330,7 @@ impl Checkpoint {
         b.push_str(",\"blocked\":\"");
         crate::json::escape_into(&self.blocked, &mut b);
         b.push_str("\",\"files\":"); json_str_array(&mut b, &self.files);
-        b.push_str(",\"timestamp\":"); push_u64(&mut b, self.timestamp);
+        b.push_str(",\"timestamp\":"); crate::text::itoa_push_u64(&mut b, self.timestamp);
         b.push_str("}\n");
         b
     }

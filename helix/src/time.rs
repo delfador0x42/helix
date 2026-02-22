@@ -87,11 +87,11 @@ pub fn days_from_civil(z: i64) -> (i32, u32, u32) {
 pub fn resolve_date_shortcut(s: &str) -> String {
     let now = LocalTime::now();
     match s {
-        "today" => format!("{:04}-{:02}-{:02}", now.year, now.month, now.day),
+        "today" => date_string(now.year, now.month, now.day),
         "yesterday" | "this-week" | "this_week" | "week" | "this-month" | "this_month" | "month" => {
             let offset = match s { "yesterday" => 1, "this-week"|"this_week"|"week" => 7, _ => 30 };
             let (y, m, d) = days_from_civil(now.to_days() - offset);
-            format!("{y:04}-{m:02}-{d:02}")
+            date_string(y, m, d)
         }
         _ => s.to_string(),
     }
@@ -104,11 +104,17 @@ pub fn relative_to_date(days: Option<u64>, hours: Option<u64>) -> Option<String>
         let d = if now_min - h as i64 * 60 >= 0 { (now_min - h as i64 * 60) / 1440 }
                 else { (now_min - h as i64 * 60) / 1440 - 1 };
         let (y, m, day) = days_from_civil(d);
-        Some(format!("{y:04}-{m:02}-{day:02}"))
+        Some(date_string(y, m, day))
     } else if let Some(d) = days {
         let (y, m, day) = days_from_civil(now.to_days() - d as i64);
-        Some(format!("{y:04}-{m:02}-{day:02}"))
+        Some(date_string(y, m, day))
     } else { None }
+}
+
+fn date_string(y: i32, m: u32, d: u32) -> String {
+    let mut s = String::with_capacity(10);
+    push4(&mut s, y as u16); s.push('-'); push2(&mut s, m as u8); s.push('-'); push2(&mut s, d as u8);
+    s
 }
 
 fn civil_to_days(y: i32, m: u32, d: u32) -> i64 {

@@ -16,7 +16,10 @@ static DIRTY_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 static REBUILD_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn log_session(msg: String) {
-    if let Ok(mut log) = SESSION_LOG.lock() { log.push(msg); }
+    if let Ok(mut log) = SESSION_LOG.lock() {
+        if log.len() >= 200 { log.drain(..50); }
+        log.push(msg);
+    }
 }
 
 pub(crate) fn store_index(data: Vec<u8>) {

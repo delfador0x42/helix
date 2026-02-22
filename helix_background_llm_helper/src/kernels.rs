@@ -1,9 +1,10 @@
-//! Metal shader source for Qwen3 transformer inference.
-//! Q4_K/Q6_K dequant fused into matvec for bandwidth-optimal inference.
-//! Element-wise ops (RMSNorm, RoPE, SiLU, attention) run on GPU via single command buffer.
+//! Metal compute kernels for Llama-3.2 inference.
+//! Q4_0/Q4_1/Q6_K dequant fused into matvec. All matvec kernels use simdgroup
+//! parallelism: 8 rows per threadgroup (256 threads = 8 simdgroups of 32).
+//! Element-wise ops (RMSNorm, RoPE, SiLU, attention) in single command buffer.
 
 pub fn all_kernels() -> String {
-    format!("{HEADER}{RMSNORM}{MATVEC_Q4_0}{MATVEC_Q4_1}{MATVEC_Q4K}{MATVEC_Q6K}{MATVEC_Q4_0_ADD}{MATVEC_Q4_1_ADD}{MATVEC_Q4K_ADD}{MATVEC_Q6K_ADD}{EMBED_Q4_0}{EMBED_Q6K}{ROPE}{KV_STORE}{ATTENTION}{SILU_MUL}{RESIDUAL_ADD}{ARGMAX}")
+    format!("{HEADER}{RMSNORM}{MATVEC_Q4_0}{MATVEC_Q4_1}{MATVEC_Q6K}{MATVEC_Q4_0_ADD}{MATVEC_Q4_1_ADD}{MATVEC_Q6K_ADD}{EMBED_Q6K}{ROPE}{KV_STORE}{ATTENTION}{SILU_MUL}{RESIDUAL_ADD}{ARGMAX}")
 }
 
 const HEADER: &str = r#"
@@ -80,21 +81,24 @@ kernel void matvec_q4_0(
 
 /// Q4_1 dequant matvec: y = W_q4_1 @ x. Like Q4_0 but with min offset.
 /// Q4_1: 32 values/block, 20 bytes/block (2B half d, 2B half m, 16B packed nibbles)
+/// 8 rows per threadgroup via simdgroup parallelism.
 const MATVEC_Q4_1: &str = r#"
 kernel void matvec_q4_1(
     device const uchar *W    [[buffer(0)]],
     device const float *x    [[buffer(1)]],
     device float       *y    [[buffer(2)]],
     constant uint      &cols [[buffer(3)]],
-    uint gid [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]]
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]
 ) {
+    uint row_idx = tgid * 8 + simd_gid;
     uint blocks_per_row = cols / 32;
-    device const uchar *row = W + gid * blocks_per_row * 20;
+    uint row_bytes = blocks_per_row * 20;
+    device const uchar *row = W + row_idx * row_bytes;
     float sum = 0.0;
 
-    for (uint b = lid; b < blocks_per_row; b += tgs) {
+    for (uint b = simd_lid; b < blocks_per_row; b += 32) {
         device const uchar *blk = row + b * 20;
         float d = float(*((device const half *)(blk)));
         float m = float(*((device const half *)(blk + 2)));
@@ -109,77 +113,7 @@ kernel void matvec_q4_1(
     }
 
     sum = simd_sum(sum);
-    threadgroup float parts[32];
-    if (lid % 32 == 0) parts[lid / 32] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 32) {
-        float v = (lid < (tgs + 31) / 32) ? parts[lid] : 0.0;
-        v = simd_sum(v);
-        if (lid == 0) y[gid] = v;
-    }
-}
-"#;
-
-/// Q4_K dequant matvec: y = W_q4k @ x. Fused dequant in dot-product loop.
-/// Q4_K: 256 values/block, 144 bytes/block (2h d, 2h dmin, 12 scales, 128 qs)
-const MATVEC_Q4K: &str = r#"
-inline void get_scale_min_k4(int j, device const uchar *q, thread float &sc, thread float &mn) {
-    if (j < 4) {
-        sc = float(q[j] & 63);
-        mn = float(q[j + 4] & 63);
-    } else {
-        sc = float((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
-        mn = float((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
-    }
-}
-
-kernel void matvec_q4k(
-    device const uchar *W    [[buffer(0)]],
-    device const float *x    [[buffer(1)]],
-    device float       *y    [[buffer(2)]],
-    constant uint      &cols [[buffer(3)]],
-    uint gid [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]]
-) {
-    uint blocks_per_row = cols / 256;
-    device const uchar *row = W + gid * blocks_per_row * 144;
-    float sum = 0.0;
-
-    for (uint b = lid; b < blocks_per_row; b += tgs) {
-        device const uchar *blk = row + b * 144;
-        float d    = float(*((device const half *)(blk)));
-        float dmin = float(*((device const half *)(blk + 2)));
-        device const uchar *scales = blk + 4;
-        device const uchar *qs = blk + 16;
-        uint base = b * 256;
-
-        for (int pair = 0; pair < 4; pair++) {
-            int is0 = pair * 2, is1 = pair * 2 + 1;
-            float sc0, mn0, sc1, mn1;
-            get_scale_min_k4(is0, scales, sc0, mn0);
-            get_scale_min_k4(is1, scales, sc1, mn1);
-            float ds0 = d * sc0, dm0 = dmin * mn0;
-            float ds1 = d * sc1, dm1 = dmin * mn1;
-            device const uchar *qp = qs + pair * 32;
-            uint idx = base + pair * 64;
-            for (uint l = 0; l < 32; l++) {
-                uchar qb = qp[l];
-                sum += (ds0 * float(qb & 0xF) - dm0) * x[idx + l];
-                sum += (ds1 * float(qb >> 4)   - dm1) * x[idx + 32 + l];
-            }
-        }
-    }
-
-    sum = simd_sum(sum);
-    threadgroup float parts[32];
-    if (lid % 32 == 0) parts[lid / 32] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 32) {
-        float v = (lid < (tgs + 31) / 32) ? parts[lid] : 0.0;
-        v = simd_sum(v);
-        if (lid == 0) y[gid] = v;
-    }
+    if (simd_lid == 0) y[row_idx] = sum;
 }
 "#;
 

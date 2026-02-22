@@ -43,12 +43,13 @@ pub fn run_brief(dir: &Path, query: &str, limit: Option<usize>, filter: &Filter,
     if fallback { let _ = writeln!(out, "(no exact match — showing OR results)"); }
     for r in &results {
         let tags = extract_tags(&r.lines);
-        let tag_suffix = tags.map(|t| format!(" {t}")).unwrap_or_default();
         let content = r.lines.iter().skip(1)
             .find(|l| !crate::text::is_metadata_line(l) && !l.trim().is_empty())
             .map(|l| truncate(l.trim().trim_start_matches("- "), 80))
             .unwrap_or("");
-        let _ = writeln!(out, "  [{}] {content}{tag_suffix} ({:.1})", r.name, r.score);
+        let _ = write!(out, "  [{}] {content}", r.name);
+        if let Some(ref t) = tags { out.push(' '); out.push_str(t); }
+        let _ = writeln!(out, " ({:.1})", r.score);
     }
     if results.is_empty() { let _ = writeln!(out, "no matches for '{query}'"); }
     else { let _ = writeln!(out, "{} match(es)", results.len()); }
@@ -65,8 +66,9 @@ pub fn run_medium(dir: &Path, query: &str, limit: Option<usize>, filter: &Filter
     for r in &results {
         let header = r.lines.first().map(|s| s.as_str()).unwrap_or("??");
         let tags = extract_tags(&r.lines);
-        let tag_str = tags.map(|t| format!(" {t}")).unwrap_or_default();
-        let _ = writeln!(out, "  [{}] {}{} ({:.1})", r.name, header.trim_start_matches("## "), tag_str, r.score);
+        let _ = write!(out, "  [{}] {}", r.name, header.trim_start_matches("## "));
+        if let Some(ref t) = tags { out.push(' '); out.push_str(t); }
+        let _ = writeln!(out, " ({:.1})", r.score);
         let mut n = 0;
         for line in r.lines.iter().skip(1) {
             if crate::text::is_metadata_line(line) || line.trim().is_empty() { continue; }

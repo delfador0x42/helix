@@ -190,7 +190,14 @@ pub fn tag(dir: &Path, topic: &str, add_tags: Option<&str>, remove_tags: Option<
     let content_lines: Vec<&str> = target.body.lines()
         .filter(|l| !l.starts_with("[tags: ")).collect();
     let mut new_body = String::new();
-    if !tags.is_empty() { new_body.push_str(&format!("[tags: {}]\n", tags.join(", "))); }
+    if !tags.is_empty() {
+        new_body.push_str("[tags: ");
+        for (i, t) in tags.iter().enumerate() {
+            if i > 0 { new_body.push_str(", "); }
+            new_body.push_str(t);
+        }
+        new_body.push_str("]\n");
+    }
     for line in content_lines { new_body.push_str(line); new_body.push('\n'); }
     let new_body = new_body.trim_end().to_string();
 
@@ -209,11 +216,20 @@ pub fn topic_entries(log_path: &Path, topic: &str) -> Result<Vec<crate::datalog:
 
 fn build_body(text: &str, tags: Option<&str>, source: Option<&str>,
               confidence: Option<f64>, links: Option<&str>) -> String {
-    let mut body = String::new();
-    if let Some(t) = tags { if !t.is_empty() { body.push_str(&format!("[tags: {t}]\n")); } }
-    if let Some(src) = source { body.push_str(&format!("[source: {src}]\n")); }
-    if let Some(c) = confidence { if c < 1.0 { body.push_str(&format!("[confidence: {c}]\n")); } }
-    if let Some(l) = links { if !l.is_empty() { body.push_str(&format!("[links: {l}]\n")); } }
+    let mut body = String::with_capacity(text.len() + 128);
+    if let Some(t) = tags { if !t.is_empty() {
+        body.push_str("[tags: "); body.push_str(t); body.push_str("]\n");
+    }}
+    if let Some(src) = source {
+        body.push_str("[source: "); body.push_str(src); body.push_str("]\n");
+    }
+    if let Some(c) = confidence { if c < 1.0 {
+        use std::fmt::Write;
+        let _ = write!(body, "[confidence: {c}]\n");
+    }}
+    if let Some(l) = links { if !l.is_empty() {
+        body.push_str("[links: "); body.push_str(l); body.push_str("]\n");
+    }}
     body.push_str(text);
     body
 }

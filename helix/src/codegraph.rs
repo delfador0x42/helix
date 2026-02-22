@@ -206,7 +206,7 @@ fn extract_ident(s: &str) -> Option<String> {
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
+    crate::text::truncate(s, max)
 }
 
 // ══════════ Usage Search ══════════
@@ -501,24 +501,6 @@ pub fn analyze_project(root: &Path) -> ProjectAnalysis {
                 }
             }
         }
-    }
-
-    // Track external users
-    for (src_idx, fa) in file_analyses.iter().enumerate() {
-        let mut users = crate::fxhash::FxHashSet::default();
-        for sym in &fa.symbols {
-            if sym.name.len() < 4 { continue; }
-            for (dst_idx, (_, content, _, _, _, _)) in file_data.iter().enumerate() {
-                if src_idx == dst_idx { continue; }
-                if contains_word_in_content(content, &sym.name) {
-                    users.insert(dst_idx);
-                }
-            }
-        }
-        // Can't mutate during iteration, so store and update after
-        let count = users.len() as u16;
-        // SAFETY: src_idx is valid
-        let _ = count; // handled below
     }
 
     // Build coupling list (sorted by strength)

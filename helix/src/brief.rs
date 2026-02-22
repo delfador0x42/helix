@@ -185,16 +185,19 @@ fn temporal_chains(entries: &mut Vec<Compressed>, _tokens: &[FxHashSet<String>])
         if indices.len() < 2 { continue; }
         let mut sorted: Vec<usize> = indices.clone();
         sorted.sort_by(|a, b| entries[*b].days_old.cmp(&entries[*a].days_old));
-        let steps: Vec<String> = sorted.iter().map(|&i| {
+        let newest = *sorted.last().unwrap();
+        let mut chain = String::with_capacity(sorted.len() * 30);
+        chain.push_str(term); chain.push_str(": ");
+        for (si, &i) in sorted.iter().enumerate() {
+            if si > 0 { chain.push_str(" → "); }
             let fc = first_content(&entries[i].body);
             let without = fc.replace(term.as_str(), "");
             let words: Vec<&str> = without.split_whitespace().take(5).collect();
             let step = words.join(" ");
-            if step.is_empty() { entries[i].date[5..].to_string() }
-            else { format!("{} ({})", step, &entries[i].date[5..]) }
-        }).collect();
-        let newest = *sorted.last().unwrap();
-        entries[newest].chain = Some(format!("{}: {}", term, steps.join(" → ")));
+            if step.is_empty() { chain.push_str(&entries[i].date[5..]); }
+            else { chain.push_str(&step); chain.push_str(" ("); chain.push_str(&entries[i].date[5..]); chain.push(')'); }
+        }
+        entries[newest].chain = Some(chain);
         entries[newest].relevance += sorted.len() as f64;
         for &idx in sorted.iter().take(sorted.len() - 1) { remove.push(idx); }
     }
@@ -326,9 +329,10 @@ fn format_output(entries: &[Compressed], query: &str, raw_count: usize,
 }
 
 fn format_entry(out: &mut String, e: &Compressed, max_lines: usize) {
-    let src = e.source.as_deref().map(|s| format!(" → {s}")).unwrap_or_default();
-    let fresh = freshness(e.days_old);
-    let _ = writeln!(out, "[{}] {}{}{}", e.topic, e.date, fresh, src);
+    out.push('['); out.push_str(&e.topic); out.push_str("] ");
+    out.push_str(&e.date); out.push_str(freshness(e.days_old));
+    if let Some(ref s) = e.source { out.push_str(" → "); out.push_str(s); }
+    out.push('\n');
     if let Some(ref chain) = e.chain {
         let _ = writeln!(out, "  {}", crate::text::truncate(chain, 120));
     }
@@ -340,13 +344,16 @@ fn format_entry(out: &mut String, e: &Compressed, max_lines: usize) {
 
 fn format_oneliner(out: &mut String, e: &Compressed) {
     let fc = crate::text::truncate(first_content(&e.body), 80);
-    let src = e.source.as_deref().map(|s| format!(" → {s}")).unwrap_or_default();
-    let chain = match &e.chain {
-        Some(c) if c.starts_with("superseded") => " [SUPERSEDED]".to_string(),
-        Some(c) => format!(" ({})", crate::text::truncate(c, 60)),
-        None => String::new(),
-    };
-    let _ = writeln!(out, "  [{}] {}{}{}{}", e.topic, fc, src, chain, freshness(e.days_old));
+    out.push_str("  ["); out.push_str(&e.topic); out.push_str("] ");
+    out.push_str(fc);
+    if let Some(ref s) = e.source { out.push_str(" → "); out.push_str(s); }
+    match &e.chain {
+        Some(c) if c.starts_with("superseded") => out.push_str(" [SUPERSEDED]"),
+        Some(c) => { out.push_str(" ("); out.push_str(crate::text::truncate(c, 60)); out.push(')'); }
+        None => {}
+    }
+    out.push_str(freshness(e.days_old));
+    out.push('\n');
 }
 
 fn freshness(days: i64) -> &'static str {

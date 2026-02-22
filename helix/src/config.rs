@@ -17,9 +17,20 @@ pub fn ensure_dir(dir: &Path) -> Result<(), String> {
 }
 
 pub fn sanitize_topic(topic: &str) -> String {
-    topic.to_lowercase().chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
-        .collect()
+    let bytes = topic.as_bytes();
+    if bytes.iter().all(|b| b.is_ascii()) {
+        let mut out = String::with_capacity(bytes.len());
+        for &b in bytes {
+            out.push(if b.is_ascii_alphanumeric() || b == b'-' {
+                b.to_ascii_lowercase() as char
+            } else { '-' });
+        }
+        out
+    } else {
+        topic.to_lowercase().chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+            .collect()
+    }
 }
 
 pub fn log_path(dir: &Path) -> PathBuf { dir.join("data.log") }

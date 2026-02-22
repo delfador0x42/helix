@@ -113,22 +113,23 @@ fn session(input: &str, dir: &Path) -> Result<String, String> {
         "resume" => msg.push_str("HELIX KB (session resumed): "),
         _ => msg.push_str("HELIX KNOWLEDGE STORE: "),
     }
-    push_u32(&mut msg, total_entries as u32);
+    crate::text::itoa_push(&mut msg, total_entries as u32);
     msg.push_str(" entries across ");
-    push_u32(&mut msg, topics.len() as u32);
+    crate::text::itoa_push(&mut msg, topics.len() as u32);
     msg.push_str(" topics.\nTopics: ");
     let mut sorted = topics;
     // Sort by recency (most recently updated first), not entry count
     let recency = crate::index::topic_recency(data);
+    let recency_map: crate::fxhash::FxHashMap<u16, i32> = recency.iter().map(|&(id, d)| (id, d)).collect();
     sorted.sort_by(|a, b| {
-        let ra = recency.iter().find(|&&(id, _)| id == a.0).map(|&(_, d)| d).unwrap_or(0);
-        let rb = recency.iter().find(|&&(id, _)| id == b.0).map(|&(_, d)| d).unwrap_or(0);
+        let ra = recency_map.get(&a.0).copied().unwrap_or(0);
+        let rb = recency_map.get(&b.0).copied().unwrap_or(0);
         rb.cmp(&ra)
     });
     for (i, (_, name, count)) in sorted.iter().take(15).enumerate() {
         if i > 0 { msg.push_str(", "); }
         msg.push_str(name);
-        msg.push_str(" ("); push_u32(&mut msg, *count as u32); msg.push(')');
+        msg.push_str(" ("); crate::text::itoa_push(&mut msg, *count as u32); msg.push(')');
     }
     msg.push_str("\nBEFORE starting work, call mcp__helix__search with keywords relevant to your task.");
     Ok(hook_output(&msg))
@@ -401,18 +402,19 @@ fn pre_compact(dir: &Path) -> Result<String, String> {
 
     let mut msg = String::with_capacity(512);
     msg.push_str("CONTEXT PRESERVED — HELIX KB: ");
-    push_u32(&mut msg, topics.len() as u32);
+    crate::text::itoa_push(&mut msg, topics.len() as u32);
     msg.push_str(" topics available. After compaction, search helix for knowledge.\nTopics: ");
     let mut sorted = topics;
     let recency = crate::index::topic_recency(data);
+    let recency_map: crate::fxhash::FxHashMap<u16, i32> = recency.iter().map(|&(id, d)| (id, d)).collect();
     sorted.sort_by(|a, b| {
-        let ra = recency.iter().find(|&&(id, _)| id == a.0).map(|&(_, d)| d).unwrap_or(0);
-        let rb = recency.iter().find(|&&(id, _)| id == b.0).map(|&(_, d)| d).unwrap_or(0);
+        let ra = recency_map.get(&a.0).copied().unwrap_or(0);
+        let rb = recency_map.get(&b.0).copied().unwrap_or(0);
         rb.cmp(&ra)
     });
     for (i, (_, name, count)) in sorted.iter().take(15).enumerate() {
         if i > 0 { msg.push_str(", "); }
-        msg.push_str(name); msg.push_str(" ("); push_u32(&mut msg, *count as u32); msg.push(')');
+        msg.push_str(name); msg.push_str(" ("); crate::text::itoa_push(&mut msg, *count as u32); msg.push(')');
     }
     Ok(hook_output(&msg))
 }
@@ -456,10 +458,15 @@ fn subagent_start(dir: &Path) -> Result<String, String> {
     let topic_list = mmap_index(dir)
         .and_then(|data| {
             let topics = crate::index::topic_table(data).ok()?;
-            let mut list: Vec<String> = topics.iter()
-                .map(|(_, name, count)| format!("{name} ({count})")).collect();
-            list.sort();
-            Some(list.join(", "))
+            let mut sorted: Vec<_> = topics.iter().collect();
+            sorted.sort_by(|a, b| a.1.cmp(&b.1));
+            let mut list = String::with_capacity(sorted.len() * 24);
+            for (i, (_, name, count)) in sorted.iter().enumerate() {
+                if i > 0 { list.push_str(", "); }
+                list.push_str(name); list.push_str(" (");
+                crate::text::itoa_push(&mut list, *count as u32); list.push(')');
+            }
+            Some(list)
         })
         .or_else(|| crate::sock::query(dir, r#"{"op":"topics"}"#));
     // Check session: if parent already injected context, tell subagent
@@ -554,25 +561,25 @@ pub fn extract_removed_syms(input: &crate::json::Value, stem: &str) -> Vec<Strin
     removed
 }
 
-/// 6-layer smart ambient context with deduplication:
+/// 7-layer smart ambient context with deduplication:
 ///   1. Source-path matches — entries with [source:] metadata for this file
 ///   2. Symbol-based OR search — fn/struct/enum names from file (cached)
 ///   3. Global BM25 — stem keyword search
 ///   4. Structural coupling — "structural <stem>" query
 ///   5. Refactor impact — removed symbols (Edit only, KB search)
 ///   6. Code blast radius — removed symbols (Edit only, codegraph usages)
+///   7. Project code analysis — module map, coupling, patterns from code-<project> topic
 ///
 /// Adaptive: Layer 2 skipped when Layer 1 returns 5+ hits.
+/// Layer 7 only fires on first file touch per project per session.
 /// Cow<str>: Layer 1 borrows from mmap (zero alloc), other layers own.
-pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], session: Option<&mut crate::session::Session>) -> String {
+pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], mut session: Option<&mut crate::session::Session>) -> String {
     let filename = std::path::Path::new(file_path)
         .file_name().and_then(|f| f.to_str()).unwrap_or(stem);
-    // Snapshot injected set for dedup (avoids borrow conflict with mutable session)
-    let injected_snapshot = session.as_ref().map(|s| s.injected.clone());
+    // Pre-populate seen with previously injected entries (no clone — iterate directly)
     let mut seen = crate::fxhash::FxHashSet::default();
-    // Pre-populate seen with previously injected entries
-    if let Some(ref snap) = injected_snapshot {
-        for &eid in snap.iter() { seen.insert(eid); }
+    if let Some(ref s) = session {
+        for &eid in s.injected.iter() { seen.insert(eid); }
     }
     let mut pool: Vec<std::borrow::Cow<str>> = Vec::with_capacity(32);
 
@@ -642,14 +649,19 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], se
     }
     let l5 = pool.len() - l5_start;
 
+    // Project root: compute once for Layer 6 + Layer 7
+    let project_root = find_project_root(file_path);
+    let project_name = project_root.as_ref()
+        .and_then(|root| root.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()));
+
     // Layer 6: Code blast radius (Edit only, codegraph)
     // When symbols are removed, find code files that reference them.
     let mut code_blast: Vec<String> = Vec::new();
     if !syms.is_empty() {
-        if let Some(root) = find_project_root(file_path) {
-            let files = crate::codegraph::walk_source_files(&root);
+        if let Some(ref root) = project_root {
+            let files = crate::codegraph::walk_source_files(root);
             for sym in syms {
-                let usages = crate::codegraph::find_usages(&root, &files, sym, "", 0);
+                let usages = crate::codegraph::find_usages(root, &files, sym, "", 0);
                 if usages.is_empty() { continue; }
                 let mut line = String::with_capacity(64);
                 line.push_str(sym);
@@ -679,6 +691,35 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], se
     }
     let l6 = code_blast.len();
 
+    // Layer 7: Project code analysis — inject module map, coupling, patterns on first touch
+    let mut code_analysis: Vec<String> = Vec::new();
+    if let Some(ref pname) = project_name {
+        let already = session.as_ref().map(|s| s.project_analyzed(pname)).unwrap_or(false);
+        if !already {
+            // Search KB for code-<project> topic entries (sanitize to match trace analyze storage)
+            let sanitized = pname.to_lowercase().replace('_', "-");
+            let topic = format!("code-{sanitized}");
+            for hit in idx_search(data, &topic, 10) {
+                if seen.insert(hit.entry_id) {
+                    code_analysis.push(hit.snippet);
+                }
+            }
+            // Also search with code-analysis tag to catch entries stored by trace analyze
+            if code_analysis.is_empty() {
+                let query = format!("code-analysis {pname}");
+                for hit in idx_search(data, &query, 8) {
+                    if seen.insert(hit.entry_id) {
+                        code_analysis.push(hit.snippet);
+                    }
+                }
+            }
+            if let Some(ref mut sess) = session {
+                sess.mark_project_analyzed(pname);
+            }
+        }
+    }
+    let l7 = code_analysis.len();
+
     // Directory fallback: when file stem is unknown to KB, try parent dir name.
     // Catches new files in known directories (e.g. new probe in Scanners/).
     if pool.is_empty() || (l1 == 0 && l3 == 0) {
@@ -696,9 +737,9 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], se
 
     // Session bookkeeping: mark injected entries + auto-infer focus topics
     if let Some(sess) = session {
-        // Mark all entries we're about to inject
+        // Mark new entries (not already in session.injected before this call)
         for &eid in &seen {
-            if injected_snapshot.as_ref().map(|s| !s.contains(&eid)).unwrap_or(true) {
+            if !sess.was_injected(eid) {
                 sess.mark_injected(eid);
             }
         }
@@ -719,8 +760,9 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], se
     }
 
     // Single output pass
-    let est = pool.iter().map(|s| s.len() + 4).sum::<usize>() + 6 * 40
-        + code_blast.iter().map(|s| s.len() + 4).sum::<usize>();
+    let est = pool.iter().map(|s| s.len() + 4).sum::<usize>() + 8 * 40
+        + code_blast.iter().map(|s| s.len() + 4).sum::<usize>()
+        + code_analysis.iter().map(|s| s.len() + 4).sum::<usize>();
     let mut out = String::with_capacity(est);
     let counts = [l1, l2, l3, l4, l5];
     let mut pool_idx = 0;
@@ -752,6 +794,15 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], se
         if !out.is_empty() { out.push_str("---\n"); }
         out.push_str("CODE BLAST RADIUS (callers/references that may break):\n");
         for line in &code_blast {
+            out.push_str("  "); out.push_str(line); out.push('\n');
+        }
+    }
+    // Layer 7: Project code analysis (separate from KB pool)
+    if l7 > 0 {
+        if !out.is_empty() { out.push_str("---\n"); }
+        let pname = project_name.as_deref().unwrap_or("project");
+        out.push_str("PROJECT ANALYSIS ("); out.push_str(pname); out.push_str("):\n");
+        for line in &code_analysis {
             out.push_str("  "); out.push_str(line); out.push('\n');
         }
     }
@@ -837,7 +888,7 @@ fn cached_file_symbols(path: &str) -> Vec<String> {
     }
     let syms = extract_file_symbols(path);
     let mut buf = String::with_capacity(path.len() + 32 + syms.len() * 20);
-    buf.push_str(path); buf.push('\n'); push_u64(&mut buf, mtime);
+    buf.push_str(path); buf.push('\n'); crate::text::itoa_push_u64(&mut buf, mtime);
     for sym in &syms { buf.push('\n'); buf.push_str(sym); }
     std::fs::write(SYM_CACHE_PATH, buf.as_bytes()).ok();
     syms
@@ -952,24 +1003,13 @@ pub fn hooks_status() -> Result<String, String> {
         _ => return Ok("Invalid hooks section".into()),
     };
     let mut out = String::with_capacity(256);
-    out.push_str(&events.len().to_string());
+    crate::text::itoa_push(&mut out, events.len() as u32);
     out.push_str(" hook events configured:\n");
     for (event, _) in events { out.push_str("  "); out.push_str(event); out.push('\n'); }
     Ok(out)
 }
 
 // ══════════ Helpers ══════════
-
-fn push_u32(buf: &mut String, n: u32) { crate::text::itoa_push(buf, n); }
-
-fn push_u64(buf: &mut String, n: u64) {
-    if n == 0 { buf.push('0'); return; }
-    let mut digits = [0u8; 20];
-    let mut i = 0;
-    let mut v = n;
-    while v > 0 { digits[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
-    while i > 0 { i -= 1; buf.push(digits[i] as char); }
-}
 
 // ══════════ Constants ══════════
 
