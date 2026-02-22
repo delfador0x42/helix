@@ -24,8 +24,43 @@ extern "C" {
     fn MTLCreateSystemDefaultDevice() -> Id;
 }
 
-// ── Selector + msg_send helpers ─────────────────────────────────────
+// ── Cached selectors ────────────────────────────────────────────────
+// sel_registerName does a hash lookup (~50ns). We call selectors ~2400 times
+// per forward pass. Caching eliminates all hash lookups after first use.
 
+use std::sync::atomic::{AtomicPtr, Ordering};
+
+macro_rules! cached_sel {
+    ($name:ident, $sel_str:literal) => {
+        #[inline(always)]
+        fn $name() -> Sel {
+            static CACHED: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+            let p = CACHED.load(Ordering::Relaxed);
+            if !p.is_null() { return p as Sel; }
+            let s = unsafe { sel_registerName(concat!($sel_str, "\0").as_ptr() as *const c_char) };
+            CACHED.store(s as *mut c_void, Ordering::Relaxed);
+            s
+        }
+    };
+}
+
+// Hot path selectors (called per encoder, ~200+ times per forward)
+cached_sel!(sel_computeCommandEncoder, "computeCommandEncoder");
+cached_sel!(sel_retain, "retain");
+cached_sel!(sel_release, "release");
+cached_sel!(sel_setPipelineState, "setComputePipelineState:");
+cached_sel!(sel_setBuffer, "setBuffer:offset:atIndex:");
+cached_sel!(sel_setBytes, "setBytes:length:atIndex:");
+cached_sel!(sel_dispatchThreadgroups, "dispatchThreadgroups:threadsPerThreadgroup:");
+cached_sel!(sel_dispatchThreads, "dispatchThreads:threadsPerThreadgroup:");
+cached_sel!(sel_endEncoding, "endEncoding");
+cached_sel!(sel_commit, "commit");
+cached_sel!(sel_waitUntilCompleted, "waitUntilCompleted");
+cached_sel!(sel_commandBuffer, "commandBuffer");
+cached_sel!(sel_contents, "contents");
+cached_sel!(sel_length, "length");
+
+// Cold path: still use dynamic lookup (called once at init)
 #[inline]
 fn sel(name: &str) -> Sel {
     unsafe { sel_registerName(name.as_ptr() as *const c_char) }
@@ -165,7 +200,7 @@ unsafe fn nsstring_to_str(ns: Id) -> String {
 }
 
 unsafe fn release(obj: Id) {
-    if !obj.is_null() { msg_void(obj, sel("release\0")); }
+    if !obj.is_null() { msg_void(obj, sel_release()); }
 }
 
 // ── MTLSize ─────────────────────────────────────────────────────────
@@ -324,11 +359,11 @@ impl Pipeline {
 
 impl Buffer {
     pub fn contents(&self) -> *mut c_void {
-        unsafe { msg_ptr(self.0, sel("contents\0")) }
+        unsafe { msg_ptr(self.0, sel_contents()) }
     }
 
     pub fn length(&self) -> u64 {
-        unsafe { msg_u64(self.0, sel("length\0")) }
+        unsafe { msg_u64(self.0, sel_length()) }
     }
 }
 
@@ -336,10 +371,9 @@ impl Buffer {
 
 impl CommandQueue {
     pub fn new_command_buffer(&self) -> CommandBuffer {
-        // commandBuffer returns autoreleased — we retain it so we own it
         unsafe {
-            let cb = msg_id(self.0, sel("commandBuffer\0"));
-            let _: Id = msg_id(cb, sel("retain\0"));
+            let cb = msg_id(self.0, sel_commandBuffer());
+            let _: Id = msg_id(cb, sel_retain());
             CommandBuffer(cb)
         }
     }
@@ -350,19 +384,18 @@ impl CommandQueue {
 impl CommandBuffer {
     pub fn new_compute_encoder(&self) -> ComputeEncoder {
         unsafe {
-            let enc = msg_id(self.0, sel("computeCommandEncoder\0"));
-            // autoreleased — retain so we own it
-            let _: Id = msg_id(enc, sel("retain\0"));
+            let enc = msg_id(self.0, sel_computeCommandEncoder());
+            let _: Id = msg_id(enc, sel_retain());
             ComputeEncoder(enc)
         }
     }
 
     pub fn commit(&self) {
-        unsafe { msg_void(self.0, sel("commit\0")); }
+        unsafe { msg_void(self.0, sel_commit()); }
     }
 
     pub fn wait_until_completed(&self) {
-        unsafe { msg_void(self.0, sel("waitUntilCompleted\0")); }
+        unsafe { msg_void(self.0, sel_waitUntilCompleted()); }
     }
 }
 
@@ -374,47 +407,27 @@ impl Drop for CommandBuffer {
 
 impl ComputeEncoder {
     pub fn set_pipeline(&self, pipeline: &Pipeline) {
-        unsafe { msg_void_id(self.0, sel("setComputePipelineState:\0"), pipeline.0); }
+        unsafe { msg_void_id(self.0, sel_setPipelineState(), pipeline.0); }
     }
 
     pub fn set_buffer(&self, index: u64, buffer: &Buffer, offset: u64) {
-        unsafe {
-            msg_void_id_u64_u64(
-                self.0, sel("setBuffer:offset:atIndex:\0"),
-                buffer.0, offset, index
-            );
-        }
+        unsafe { msg_void_id_u64_u64(self.0, sel_setBuffer(), buffer.0, offset, index); }
     }
 
     pub fn set_bytes(&self, index: u64, data: *const c_void, len: u64) {
-        unsafe {
-            msg_void_ptr_u64_u64(
-                self.0, sel("setBytes:length:atIndex:\0"),
-                data, len, index
-            );
-        }
+        unsafe { msg_void_ptr_u64_u64(self.0, sel_setBytes(), data, len, index); }
     }
 
     pub fn dispatch_threadgroups(&self, grid: MTLSize, threadgroup: MTLSize) {
-        unsafe {
-            msg_void_2size(
-                self.0, sel("dispatchThreadgroups:threadsPerThreadgroup:\0"),
-                grid, threadgroup
-            );
-        }
+        unsafe { msg_void_2size(self.0, sel_dispatchThreadgroups(), grid, threadgroup); }
     }
 
     pub fn dispatch_threads(&self, grid: MTLSize, threadgroup: MTLSize) {
-        unsafe {
-            msg_void_2size(
-                self.0, sel("dispatchThreads:threadsPerThreadgroup:\0"),
-                grid, threadgroup
-            );
-        }
+        unsafe { msg_void_2size(self.0, sel_dispatchThreads(), grid, threadgroup); }
     }
 
     pub fn end_encoding(&self) {
-        unsafe { msg_void(self.0, sel("endEncoding\0")); }
+        unsafe { msg_void(self.0, sel_endEncoding()); }
     }
 }
 

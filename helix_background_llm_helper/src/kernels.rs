@@ -3,7 +3,7 @@
 //! Element-wise ops (RMSNorm, RoPE, SiLU, attention) run on GPU via single command buffer.
 
 pub fn all_kernels() -> String {
-    format!("{HEADER}{RMSNORM}{MATVEC_Q4K}{MATVEC_Q6K}{EMBED_Q6K}{ROPE}{KV_STORE}{ATTENTION}{SILU_MUL}{RESIDUAL_ADD}")
+    format!("{HEADER}{RMSNORM}{MATVEC_Q4_0}{MATVEC_Q4_1}{MATVEC_Q4K}{MATVEC_Q6K}{MATVEC_Q4_0_ADD}{MATVEC_Q4_1_ADD}{MATVEC_Q4K_ADD}{MATVEC_Q6K_ADD}{EMBED_Q4_0}{EMBED_Q6K}{ROPE}{KV_STORE}{ATTENTION}{SILU_MUL}{RESIDUAL_ADD}{ARGMAX}")
 }
 
 const HEADER: &str = r#"
@@ -36,6 +36,87 @@ kernel void rmsnorm(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float rms = rsqrt(parts[0] / float(dim) + eps);
     for (uint i = lid; i < dim; i += tgs) y[i] = x[i] * rms * weight[i];
+}
+"#;
+
+/// Q4_0 dequant matvec: y = W_q4_0 @ x. Simplest quantization format.
+/// Q4_0: 32 values/block, 18 bytes/block (2B half scale + 16B packed nibbles)
+/// Each simdgroup (32 threads) handles one row. Threadgroup processes N_ROWS rows.
+const MATVEC_Q4_0: &str = r#"
+kernel void matvec_q4_0(
+    device const uchar *W    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device float       *y    [[buffer(2)]],
+    constant uint      &cols [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]
+) {
+    // Each simdgroup (32 threads) processes one row
+    // With 256 threads per threadgroup = 8 simdgroups = 8 rows per threadgroup
+    uint row_idx = tgid * 8 + simd_gid;
+    uint blocks_per_row = cols / 32;
+    uint row_bytes = blocks_per_row * 18;
+    device const uchar *row = W + row_idx * row_bytes;
+    float sum = 0.0;
+
+    for (uint b = simd_lid; b < blocks_per_row; b += 32) {
+        device const uchar *blk = row + b * 18;
+        float d = float(*((device const half *)(blk)));
+        device const uchar *qs = blk + 2;
+        uint base = b * 32;
+
+        for (uint i = 0; i < 16; i++) {
+            uchar qb = qs[i];
+            sum += d * (float(qb & 0xF) - 8.0) * x[base + i];
+            sum += d * (float(qb >> 4) - 8.0) * x[base + 16 + i];
+        }
+    }
+
+    sum = simd_sum(sum);
+    if (simd_lid == 0) y[row_idx] = sum;
+}
+"#;
+
+/// Q4_1 dequant matvec: y = W_q4_1 @ x. Like Q4_0 but with min offset.
+/// Q4_1: 32 values/block, 20 bytes/block (2B half d, 2B half m, 16B packed nibbles)
+const MATVEC_Q4_1: &str = r#"
+kernel void matvec_q4_1(
+    device const uchar *W    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device float       *y    [[buffer(2)]],
+    constant uint      &cols [[buffer(3)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]
+) {
+    uint blocks_per_row = cols / 32;
+    device const uchar *row = W + gid * blocks_per_row * 20;
+    float sum = 0.0;
+
+    for (uint b = lid; b < blocks_per_row; b += tgs) {
+        device const uchar *blk = row + b * 20;
+        float d = float(*((device const half *)(blk)));
+        float m = float(*((device const half *)(blk + 2)));
+        device const uchar *qs = blk + 4;
+        uint base = b * 32;
+
+        for (uint i = 0; i < 16; i++) {
+            uchar qb = qs[i];
+            sum += (d * float(qb & 0xF) + m) * x[base + i];
+            sum += (d * float(qb >> 4) + m) * x[base + 16 + i];
+        }
+    }
+
+    sum = simd_sum(sum);
+    threadgroup float parts[32];
+    if (lid % 32 == 0) parts[lid / 32] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 32) {
+        float v = (lid < (tgs + 31) / 32) ? parts[lid] : 0.0;
+        v = simd_sum(v);
+        if (lid == 0) y[gid] = v;
+    }
 }
 "#;
 
@@ -104,21 +185,23 @@ kernel void matvec_q4k(
 
 /// Q6_K dequant matvec: y = W_q6k @ x.
 /// Q6_K: 256 values/block, 210 bytes/block (128 ql, 64 qh, 16 scales, 2 d)
+/// Each simdgroup (32 threads) handles one row. 8 rows per threadgroup.
 const MATVEC_Q6K: &str = r#"
 kernel void matvec_q6k(
     device const uchar *W    [[buffer(0)]],
     device const float *x    [[buffer(1)]],
     device float       *y    [[buffer(2)]],
     constant uint      &cols [[buffer(3)]],
-    uint gid [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]]
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]
 ) {
+    uint row_idx = tgid * 8 + simd_gid;
     uint blocks_per_row = cols / 256;
-    device const uchar *row = W + gid * blocks_per_row * 210;
+    device const uchar *row = W + row_idx * blocks_per_row * 210;
     float sum = 0.0;
 
-    for (uint b = lid; b < blocks_per_row; b += tgs) {
+    for (uint b = simd_lid; b < blocks_per_row; b += 32) {
         device const uchar *blk = row + b * 210;
         device const uchar *ql = blk;
         device const uchar *qh = blk + 128;
@@ -130,22 +213,55 @@ kernel void matvec_q6k(
             uint sb = n * 8;
             device const uchar *qlp = ql + n * 64;
             device const uchar *qhp = qh + n * 32;
-            float s0 = d * float(sc[sb+0]), s2 = d * float(sc[sb+2]);
-            float s4 = d * float(sc[sb+4]), s6 = d * float(sc[sb+6]);
             uint idx = base + n * 128;
-            for (uint l = 0; l < 32; l++) {
-                int q1 = (int(qlp[l]    & 0xF) | (int((qhp[l] >> 0) & 3) << 4)) - 32;
-                int q2 = (int(qlp[l+32] & 0xF) | (int((qhp[l] >> 2) & 3) << 4)) - 32;
-                int q3 = (int(qlp[l]     >> 4) | (int((qhp[l] >> 4) & 3) << 4)) - 32;
-                int q4 = (int(qlp[l+32]  >> 4) | (int((qhp[l] >> 6) & 3) << 4)) - 32;
-                sum += s0 * float(q1) * x[idx + l];
-                sum += s2 * float(q2) * x[idx + 32 + l];
-                sum += s4 * float(q3) * x[idx + 64 + l];
-                sum += s6 * float(q4) * x[idx + 96 + l];
+            for (uint h = 0; h < 2; h++) {
+                float s0 = d * float(sc[sb+h+0]), s2 = d * float(sc[sb+h+2]);
+                float s4 = d * float(sc[sb+h+4]), s6 = d * float(sc[sb+h+6]);
+                for (uint l = h * 16; l < h * 16 + 16; l++) {
+                    int q1 = (int(qlp[l]    & 0xF) | (int((qhp[l] >> 0) & 3) << 4)) - 32;
+                    int q2 = (int(qlp[l+32] & 0xF) | (int((qhp[l] >> 2) & 3) << 4)) - 32;
+                    int q3 = (int(qlp[l]     >> 4) | (int((qhp[l] >> 4) & 3) << 4)) - 32;
+                    int q4 = (int(qlp[l+32]  >> 4) | (int((qhp[l] >> 6) & 3) << 4)) - 32;
+                    sum += s0 * float(q1) * x[idx + l];
+                    sum += s2 * float(q2) * x[idx + 32 + l];
+                    sum += s4 * float(q3) * x[idx + 64 + l];
+                    sum += s6 * float(q4) * x[idx + 96 + l];
+                }
             }
         }
     }
 
+    sum = simd_sum(sum);
+    if (simd_lid == 0) y[row_idx] = sum;
+}
+"#;
+
+/// Fused Q4_0 matvec + residual add: residual[gid] += dot(W[gid], x).
+/// Eliminates intermediate buffer and separate residual_add dispatch.
+const MATVEC_Q4_0_ADD: &str = r#"
+kernel void matvec_q4_0_add(
+    device const uchar *W    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device float       *res  [[buffer(2)]],
+    constant uint      &cols [[buffer(3)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]
+) {
+    uint blocks_per_row = cols / 32;
+    device const uchar *row = W + gid * blocks_per_row * 18;
+    float sum = 0.0;
+    for (uint b = lid; b < blocks_per_row; b += tgs) {
+        device const uchar *blk = row + b * 18;
+        float d = float(*((device const half *)(blk)));
+        device const uchar *qs = blk + 2;
+        uint base = b * 32;
+        for (uint i = 0; i < 16; i++) {
+            uchar qb = qs[i];
+            sum += d * (float(qb & 0xF) - 8.0) * x[base + i];
+            sum += d * (float(qb >> 4) - 8.0) * x[base + 16 + i];
+        }
+    }
     sum = simd_sum(sum);
     threadgroup float parts[32];
     if (lid % 32 == 0) parts[lid / 32] = sum;
@@ -153,8 +269,176 @@ kernel void matvec_q6k(
     if (lid < 32) {
         float v = (lid < (tgs + 31) / 32) ? parts[lid] : 0.0;
         v = simd_sum(v);
-        if (lid == 0) y[gid] = v;
+        if (lid == 0) res[gid] += v;
     }
+}
+"#;
+
+/// Fused Q4_1 matvec + residual add.
+const MATVEC_Q4_1_ADD: &str = r#"
+kernel void matvec_q4_1_add(
+    device const uchar *W    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device float       *res  [[buffer(2)]],
+    constant uint      &cols [[buffer(3)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]
+) {
+    uint blocks_per_row = cols / 32;
+    device const uchar *row = W + gid * blocks_per_row * 20;
+    float sum = 0.0;
+    for (uint b = lid; b < blocks_per_row; b += tgs) {
+        device const uchar *blk = row + b * 20;
+        float d = float(*((device const half *)(blk)));
+        float m = float(*((device const half *)(blk + 2)));
+        device const uchar *qs = blk + 4;
+        uint base = b * 32;
+        for (uint i = 0; i < 16; i++) {
+            uchar qb = qs[i];
+            sum += (d * float(qb & 0xF) + m) * x[base + i];
+            sum += (d * float(qb >> 4) + m) * x[base + 16 + i];
+        }
+    }
+    sum = simd_sum(sum);
+    threadgroup float parts[32];
+    if (lid % 32 == 0) parts[lid / 32] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 32) {
+        float v = (lid < (tgs + 31) / 32) ? parts[lid] : 0.0;
+        v = simd_sum(v);
+        if (lid == 0) res[gid] += v;
+    }
+}
+"#;
+
+/// Fused Q4_K matvec + residual add.
+const MATVEC_Q4K_ADD: &str = r#"
+inline void get_scale_min_k4_add(int j, device const uchar *q, thread float &sc, thread float &mn) {
+    if (j < 4) { sc = float(q[j] & 63); mn = float(q[j + 4] & 63); }
+    else { sc = float((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4)); mn = float((q[j + 4] >> 4) | ((q[j] >> 6) << 4)); }
+}
+kernel void matvec_q4k_add(
+    device const uchar *W    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device float       *res  [[buffer(2)]],
+    constant uint      &cols [[buffer(3)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]
+) {
+    uint blocks_per_row = cols / 256;
+    device const uchar *row = W + gid * blocks_per_row * 144;
+    float sum = 0.0;
+    for (uint b = lid; b < blocks_per_row; b += tgs) {
+        device const uchar *blk = row + b * 144;
+        float d    = float(*((device const half *)(blk)));
+        float dmin = float(*((device const half *)(blk + 2)));
+        device const uchar *scales = blk + 4;
+        device const uchar *qs = blk + 16;
+        uint base = b * 256;
+        for (int pair = 0; pair < 4; pair++) {
+            int is0 = pair * 2, is1 = pair * 2 + 1;
+            float sc0, mn0, sc1, mn1;
+            get_scale_min_k4_add(is0, scales, sc0, mn0);
+            get_scale_min_k4_add(is1, scales, sc1, mn1);
+            float ds0 = d * sc0, dm0 = dmin * mn0;
+            float ds1 = d * sc1, dm1 = dmin * mn1;
+            device const uchar *qp = qs + pair * 32;
+            uint idx = base + pair * 64;
+            for (uint l = 0; l < 32; l++) {
+                uchar qb = qp[l];
+                sum += (ds0 * float(qb & 0xF) - dm0) * x[idx + l];
+                sum += (ds1 * float(qb >> 4)   - dm1) * x[idx + 32 + l];
+            }
+        }
+    }
+    sum = simd_sum(sum);
+    threadgroup float parts[32];
+    if (lid % 32 == 0) parts[lid / 32] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 32) {
+        float v = (lid < (tgs + 31) / 32) ? parts[lid] : 0.0;
+        v = simd_sum(v);
+        if (lid == 0) res[gid] += v;
+    }
+}
+"#;
+
+/// Fused Q6_K matvec + residual add.
+const MATVEC_Q6K_ADD: &str = r#"
+kernel void matvec_q6k_add(
+    device const uchar *W    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device float       *res  [[buffer(2)]],
+    constant uint      &cols [[buffer(3)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]
+) {
+    uint blocks_per_row = cols / 256;
+    device const uchar *row = W + gid * blocks_per_row * 210;
+    float sum = 0.0;
+    for (uint b = lid; b < blocks_per_row; b += tgs) {
+        device const uchar *blk = row + b * 210;
+        device const uchar *ql = blk;
+        device const uchar *qh = blk + 128;
+        device const char  *sc = (device const char *)(blk + 192);
+        float d = float(*((device const half *)(blk + 208)));
+        uint base = b * 256;
+        for (uint n = 0; n < 2; n++) {
+            uint sb = n * 8;
+            device const uchar *qlp = ql + n * 64;
+            device const uchar *qhp = qh + n * 32;
+            uint idx = base + n * 128;
+            for (uint h = 0; h < 2; h++) {
+                float s0 = d * float(sc[sb+h+0]), s2 = d * float(sc[sb+h+2]);
+                float s4 = d * float(sc[sb+h+4]), s6 = d * float(sc[sb+h+6]);
+                for (uint l = h * 16; l < h * 16 + 16; l++) {
+                    int q1 = (int(qlp[l]    & 0xF) | (int((qhp[l] >> 0) & 3) << 4)) - 32;
+                    int q2 = (int(qlp[l+32] & 0xF) | (int((qhp[l] >> 2) & 3) << 4)) - 32;
+                    int q3 = (int(qlp[l]     >> 4) | (int((qhp[l] >> 4) & 3) << 4)) - 32;
+                    int q4 = (int(qlp[l+32]  >> 4) | (int((qhp[l] >> 6) & 3) << 4)) - 32;
+                    sum += s0 * float(q1) * x[idx + l];
+                    sum += s2 * float(q2) * x[idx + 32 + l];
+                    sum += s4 * float(q3) * x[idx + 64 + l];
+                    sum += s6 * float(q4) * x[idx + 96 + l];
+                }
+            }
+        }
+    }
+    sum = simd_sum(sum);
+    threadgroup float parts[32];
+    if (lid % 32 == 0) parts[lid / 32] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 32) {
+        float v = (lid < (tgs + 31) / 32) ? parts[lid] : 0.0;
+        v = simd_sum(v);
+        if (lid == 0) res[gid] += v;
+    }
+}
+"#;
+
+/// Dequant single row from Q4_0 embedding table.
+/// Launch with dim threads. Q4_0: 32 vals/block, 18 bytes/block.
+const EMBED_Q4_0: &str = r#"
+kernel void embed_q4_0(
+    device const uchar *W        [[buffer(0)]],
+    device float       *out      [[buffer(1)]],
+    constant uint      &dim      [[buffer(2)]],
+    constant uint      &token_id [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= dim) return;
+    uint bpr = dim / 32;
+    device const uchar *row = W + token_id * bpr * 18;
+    uint bi = gid / 32, vi = gid % 32;
+    device const uchar *blk = row + bi * 18;
+    float d = float(*((device const half *)(blk)));
+    device const uchar *qs = blk + 2;
+    uchar qb = qs[vi < 16 ? vi : vi - 16];
+    float q = (vi < 16) ? float(qb & 0xF) - 8.0 : float(qb >> 4) - 8.0;
+    out[gid] = d * q;
 }
 "#;
 
@@ -179,13 +463,14 @@ kernel void embed_q6k(
     uint n = vi / 128, rem = vi % 128, l = rem % 32, sub = rem / 32;
     device const uchar *qlp = ql + n * 64, *qhp = qh + n * 32;
     uint sb = n * 8;
+    uint is = l / 16;  // 0 for l=0..15, 1 for l=16..31
     int q;
     float s;
     switch (sub) {
-        case 0: q = (int(qlp[l]    & 0xF) | (int((qhp[l] >> 0) & 3) << 4)) - 32; s = d * float(sc[sb+0]); break;
-        case 1: q = (int(qlp[l+32] & 0xF) | (int((qhp[l] >> 2) & 3) << 4)) - 32; s = d * float(sc[sb+2]); break;
-        case 2: q = (int(qlp[l]     >> 4) | (int((qhp[l] >> 4) & 3) << 4)) - 32; s = d * float(sc[sb+4]); break;
-        case 3: q = (int(qlp[l+32]  >> 4) | (int((qhp[l] >> 6) & 3) << 4)) - 32; s = d * float(sc[sb+6]); break;
+        case 0: q = (int(qlp[l]    & 0xF) | (int((qhp[l] >> 0) & 3) << 4)) - 32; s = d * float(sc[sb+is+0]); break;
+        case 1: q = (int(qlp[l+32] & 0xF) | (int((qhp[l] >> 2) & 3) << 4)) - 32; s = d * float(sc[sb+is+2]); break;
+        case 2: q = (int(qlp[l]     >> 4) | (int((qhp[l] >> 4) & 3) << 4)) - 32; s = d * float(sc[sb+is+4]); break;
+        case 3: q = (int(qlp[l+32]  >> 4) | (int((qhp[l] >> 6) & 3) << 4)) - 32; s = d * float(sc[sb+is+6]); break;
     }
     out[gid] = s * float(q);
 }
@@ -318,5 +603,46 @@ kernel void residual_add(
     uint gid [[thread_position_in_grid]]
 ) {
     x[gid] += y[gid];
+}
+"#;
+
+/// GPU argmax: find index of maximum value in logits. Single threadgroup.
+/// Eliminates CPU-side scan of 128K+ floats (~1.7ms → ~10µs).
+const ARGMAX: &str = r#"
+kernel void argmax(
+    device const float *logits [[buffer(0)]],
+    device uint        *result [[buffer(1)]],
+    constant uint      &n      [[buffer(2)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]]
+) {
+    // Phase 1: each thread finds local max
+    float best_val = -INFINITY;
+    uint best_id = 0;
+    for (uint i = lid; i < n; i += tgs) {
+        float v = logits[i];
+        if (v > best_val) { best_val = v; best_id = i; }
+    }
+    // Phase 2: simdgroup reduction (32 threads)
+    for (uint offset = 16; offset > 0; offset >>= 1) {
+        float other_val = simd_shuffle_down(best_val, offset);
+        uint other_id = simd_shuffle_down(best_id, offset);
+        if (other_val > best_val) { best_val = other_val; best_id = other_id; }
+    }
+    // Phase 3: threadgroup reduction
+    threadgroup float tg_vals[32];
+    threadgroup uint tg_ids[32];
+    if (lid % 32 == 0) { tg_vals[lid / 32] = best_val; tg_ids[lid / 32] = best_id; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 32) {
+        float v = (lid < (tgs + 31) / 32) ? tg_vals[lid] : -INFINITY;
+        uint id = (lid < (tgs + 31) / 32) ? tg_ids[lid] : 0;
+        for (uint offset = 16; offset > 0; offset >>= 1) {
+            float ov = simd_shuffle_down(v, offset);
+            uint oid = simd_shuffle_down(id, offset);
+            if (ov > v) { v = ov; id = oid; }
+        }
+        if (lid == 0) result[0] = id;
+    }
 }
 "#;

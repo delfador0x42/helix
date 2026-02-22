@@ -460,6 +460,7 @@ fn extract_config(meta: &HashMap<String, MetaValue>) -> Result<ModelConfig, Stri
     let head_dim = if n_heads > 0 { hidden_dim / n_heads } else { 0 };
     let rope_dim = get_u32(&format!("{arch}.rope.dimension_count"));
     let rope_freq_base = get_f32(&format!("{arch}.rope.freq_base"), 10000.0);
+    eprintln!("  CONFIG: n_layers={n_layers} n_heads={n_heads} n_kv_heads={n_kv_heads} hidden={hidden_dim} ffn={ffn_dim} vocab={vocab_size} ctx={context_len} head_dim={head_dim} rope_dim={rope_dim} rope_freq_base={rope_freq_base} arch={arch}");
     let rms_norm_eps = get_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"), 1e-6);
     let bos_token = get_u32("tokenizer.ggml.bos_token_id");
     let eos_token = get_u32("tokenizer.ggml.eos_token_id");

@@ -225,6 +225,10 @@ pub fn run_bandwidth_test() {
     ] {
         matvec_q4_test(&device, &mv_lib, rows, cols, label);
     }
+
+    // Dispatch overhead: how much does each dispatch cost inside a single cmd buffer?
+    eprintln!("\n--- Dispatch overhead (single cmd buffer, N trivial dispatches) ---");
+    dispatch_overhead_test(&device, &bw_lib);
 }
 
 fn bandwidth_test(device: &Device, library: &Library) {
@@ -433,4 +437,85 @@ fn matvec_q4_test(device: &Device, library: &Library, rows: u32, cols: u32, labe
 
     eprintln!("  {:<28} {:>6.1} GB/s  {:>8.1}us/call  (weight={:.1}MB)",
         label, gb_per_sec, us_per, w_bytes as f64 / 1e6);
+}
+
+/// Measure per-dispatch overhead inside a single command buffer.
+/// Dispatches N trivial copies in one cmd buffer, one encoder.
+/// The slope of time vs N gives us the per-dispatch cost on the GPU.
+fn dispatch_overhead_test(device: &Device, library: &Library) {
+    let func = library.get_function("bandwidth_test").expect("bandwidth_test not found");
+    let pipeline = device.new_compute_pipeline(&func).expect("pipeline");
+
+    // Small buffer — fits in cache, so we're measuring dispatch overhead not BW
+    let n_float4 = 256u64; // 4KB
+    let buf_a = device.new_buffer(n_float4 * 16);
+    let buf_b = device.new_buffer(n_float4 * 16);
+    let queue = device.new_command_queue();
+    let tew = pipeline.thread_execution_width();
+
+    for &n_dispatches in &[1u32, 10, 50, 100, 200, 300, 500] {
+        // Warmup
+        {
+            let cmd = queue.new_command_buffer();
+            let enc = cmd.new_compute_encoder();
+            enc.set_pipeline(&pipeline);
+            enc.set_buffer(0, &buf_a, 0);
+            enc.set_buffer(1, &buf_b, 0);
+            enc.dispatch_threads(MTLSize::new(n_float4, 1, 1), MTLSize::new(tew, 1, 1));
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+
+        let iters = 20u32;
+        let start = Instant::now();
+        for _ in 0..iters {
+            let cmd = queue.new_command_buffer();
+            let enc = cmd.new_compute_encoder();
+            enc.set_pipeline(&pipeline);
+            enc.set_buffer(0, &buf_a, 0);
+            enc.set_buffer(1, &buf_b, 0);
+            for _ in 0..n_dispatches {
+                enc.dispatch_threads(MTLSize::new(n_float4, 1, 1), MTLSize::new(tew, 1, 1));
+            }
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+        let elapsed = start.elapsed();
+        let us_per_cmd = elapsed.as_secs_f64() * 1e6 / iters as f64;
+        let us_per_dispatch = if n_dispatches > 1 { us_per_cmd / n_dispatches as f64 } else { us_per_cmd };
+        eprintln!("  {:>3} dispatches/cmd:  {:>8.1}µs/cmd  {:>6.2}µs/dispatch",
+            n_dispatches, us_per_cmd, us_per_dispatch);
+    }
+
+    // Same test but with DEPENDENT dispatches (A→B→A→B chain, writes to same buffer)
+    eprintln!("  --- with data dependencies (A→B→A→B chain) ---");
+    for &n_dispatches in &[1u32, 10, 50, 100, 200, 300] {
+        let iters = 20u32;
+        let start = Instant::now();
+        for _ in 0..iters {
+            let cmd = queue.new_command_buffer();
+            let enc = cmd.new_compute_encoder();
+            enc.set_pipeline(&pipeline);
+            for i in 0..n_dispatches {
+                if i % 2 == 0 {
+                    enc.set_buffer(0, &buf_a, 0);
+                    enc.set_buffer(1, &buf_b, 0);
+                } else {
+                    enc.set_buffer(0, &buf_b, 0);
+                    enc.set_buffer(1, &buf_a, 0);
+                }
+                enc.dispatch_threads(MTLSize::new(n_float4, 1, 1), MTLSize::new(tew, 1, 1));
+            }
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+        let elapsed = start.elapsed();
+        let us_per_cmd = elapsed.as_secs_f64() * 1e6 / iters as f64;
+        let us_per_dispatch = if n_dispatches > 1 { us_per_cmd / n_dispatches as f64 } else { us_per_cmd };
+        eprintln!("  {:>3} dep dispatches:  {:>8.1}µs/cmd  {:>6.2}µs/dispatch",
+            n_dispatches, us_per_cmd, us_per_dispatch);
+    }
 }
