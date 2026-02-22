@@ -4,7 +4,7 @@
 //! Element-wise ops (RMSNorm, RoPE, SiLU, attention) in single command buffer.
 
 pub fn all_kernels() -> String {
-    format!("{HEADER}{RMSNORM}{MATVEC_Q4_0}{MATVEC_Q4_1}{MATVEC_Q6K}{MATVEC_Q4_0_ADD}{MATVEC_Q4_1_ADD}{MATVEC_Q6K_ADD}{EMBED_Q6K}{ROPE}{KV_STORE}{ATTENTION}{SILU_MUL}{RESIDUAL_ADD}{ARGMAX}")
+    format!("{HEADER}{RMSNORM}{MATVEC_Q4_0}{MATVEC_Q4_1}{MATVEC_Q4K}{MATVEC_Q6K}{MATVEC_Q4_0_ADD}{MATVEC_Q4_1_ADD}{MATVEC_Q4K_ADD}{MATVEC_Q6K_ADD}{EMBED_Q4_0}{EMBED_Q6K}{ROPE}{KV_STORE}{ATTENTION}{SILU_MUL}{ARGMAX}")
 }
 
 const HEADER: &str = r#"
@@ -42,20 +42,21 @@ kernel void rmsnorm(
 
 /// Q4_0 dequant matvec: y = W_q4_0 @ x. Simplest quantization format.
 /// Q4_0: 32 values/block, 18 bytes/block (2B half scale + 16B packed nibbles)
-/// Each simdgroup (32 threads) handles one row. Threadgroup processes N_ROWS rows.
+/// Each simdgroup (32 threads) handles one row. Threadgroup processes num_sg rows.
 const MATVEC_Q4_0: &str = r#"
 kernel void matvec_q4_0(
     device const uchar *W    [[buffer(0)]],
     device const float *x    [[buffer(1)]],
     device float       *y    [[buffer(2)]],
     constant uint      &cols [[buffer(3)]],
+    constant uint      &rows [[buffer(4)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint num_sg [[simdgroups_per_threadgroup]]
 ) {
-    // Each simdgroup (32 threads) processes one row
-    // With 256 threads per threadgroup = 8 simdgroups = 8 rows per threadgroup
-    uint row_idx = tgid * 8 + simd_gid;
+    uint row_idx = tgid * num_sg + simd_gid;
+    if (row_idx >= rows) return;
     uint blocks_per_row = cols / 32;
     uint row_bytes = blocks_per_row * 18;
     device const uchar *row = W + row_idx * row_bytes;
@@ -81,18 +82,21 @@ kernel void matvec_q4_0(
 
 /// Q4_1 dequant matvec: y = W_q4_1 @ x. Like Q4_0 but with min offset.
 /// Q4_1: 32 values/block, 20 bytes/block (2B half d, 2B half m, 16B packed nibbles)
-/// 8 rows per threadgroup via simdgroup parallelism.
+/// Each simdgroup handles one row. Threadgroup processes num_sg rows.
 const MATVEC_Q4_1: &str = r#"
 kernel void matvec_q4_1(
     device const uchar *W    [[buffer(0)]],
     device const float *x    [[buffer(1)]],
     device float       *y    [[buffer(2)]],
     constant uint      &cols [[buffer(3)]],
+    constant uint      &rows [[buffer(4)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint num_sg [[simdgroups_per_threadgroup]]
 ) {
-    uint row_idx = tgid * 8 + simd_gid;
+    uint row_idx = tgid * num_sg + simd_gid;
+    if (row_idx >= rows) return;
     uint blocks_per_row = cols / 32;
     uint row_bytes = blocks_per_row * 20;
     device const uchar *row = W + row_idx * row_bytes;
@@ -119,18 +123,21 @@ kernel void matvec_q4_1(
 
 /// Q6_K dequant matvec: y = W_q6k @ x.
 /// Q6_K: 256 values/block, 210 bytes/block (128 ql, 64 qh, 16 scales, 2 d)
-/// Each simdgroup (32 threads) handles one row. 8 rows per threadgroup.
+/// Each simdgroup (32 threads) handles one row. Threadgroup processes num_sg rows.
 const MATVEC_Q6K: &str = r#"
 kernel void matvec_q6k(
     device const uchar *W    [[buffer(0)]],
     device const float *x    [[buffer(1)]],
     device float       *y    [[buffer(2)]],
     constant uint      &cols [[buffer(3)]],
+    constant uint      &rows [[buffer(4)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint num_sg [[simdgroups_per_threadgroup]]
 ) {
-    uint row_idx = tgid * 8 + simd_gid;
+    uint row_idx = tgid * num_sg + simd_gid;
+    if (row_idx >= rows) return;
     uint blocks_per_row = cols / 256;
     device const uchar *row = W + row_idx * blocks_per_row * 210;
     float sum = 0.0;
@@ -170,22 +177,27 @@ kernel void matvec_q6k(
 }
 "#;
 
-/// Fused Q4_0 matvec + residual add: residual[gid] += dot(W[gid], x).
-/// Eliminates intermediate buffer and separate residual_add dispatch.
+/// Fused Q4_0 matvec + residual add: res[row] += dot(W[row], x).
+/// Uses simdgroup-per-row pattern (same as non-fused) for max efficiency.
 const MATVEC_Q4_0_ADD: &str = r#"
 kernel void matvec_q4_0_add(
     device const uchar *W    [[buffer(0)]],
     device const float *x    [[buffer(1)]],
     device float       *res  [[buffer(2)]],
     constant uint      &cols [[buffer(3)]],
-    uint gid [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]]
+    constant uint      &rows [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint num_sg [[simdgroups_per_threadgroup]]
 ) {
+    uint row_idx = tgid * num_sg + simd_gid;
+    if (row_idx >= rows) return;
     uint blocks_per_row = cols / 32;
-    device const uchar *row = W + gid * blocks_per_row * 18;
+    uint row_bytes = blocks_per_row * 18;
+    device const uchar *row = W + row_idx * row_bytes;
     float sum = 0.0;
-    for (uint b = lid; b < blocks_per_row; b += tgs) {
+    for (uint b = simd_lid; b < blocks_per_row; b += 32) {
         device const uchar *blk = row + b * 18;
         float d = float(*((device const half *)(blk)));
         device const uchar *qs = blk + 2;
@@ -197,32 +209,30 @@ kernel void matvec_q4_0_add(
         }
     }
     sum = simd_sum(sum);
-    threadgroup float parts[32];
-    if (lid % 32 == 0) parts[lid / 32] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 32) {
-        float v = (lid < (tgs + 31) / 32) ? parts[lid] : 0.0;
-        v = simd_sum(v);
-        if (lid == 0) res[gid] += v;
-    }
+    if (simd_lid == 0) res[row_idx] += sum;
 }
 "#;
 
-/// Fused Q4_1 matvec + residual add.
+/// Fused Q4_1 matvec + residual add. Simdgroup-per-row pattern.
 const MATVEC_Q4_1_ADD: &str = r#"
 kernel void matvec_q4_1_add(
     device const uchar *W    [[buffer(0)]],
     device const float *x    [[buffer(1)]],
     device float       *res  [[buffer(2)]],
     constant uint      &cols [[buffer(3)]],
-    uint gid [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]]
+    constant uint      &rows [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint num_sg [[simdgroups_per_threadgroup]]
 ) {
+    uint row_idx = tgid * num_sg + simd_gid;
+    if (row_idx >= rows) return;
     uint blocks_per_row = cols / 32;
-    device const uchar *row = W + gid * blocks_per_row * 20;
+    uint row_bytes = blocks_per_row * 20;
+    device const uchar *row = W + row_idx * row_bytes;
     float sum = 0.0;
-    for (uint b = lid; b < blocks_per_row; b += tgs) {
+    for (uint b = simd_lid; b < blocks_per_row; b += 32) {
         device const uchar *blk = row + b * 20;
         float d = float(*((device const half *)(blk)));
         float m = float(*((device const half *)(blk + 2)));
@@ -235,18 +245,63 @@ kernel void matvec_q4_1_add(
         }
     }
     sum = simd_sum(sum);
-    threadgroup float parts[32];
-    if (lid % 32 == 0) parts[lid / 32] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 32) {
-        float v = (lid < (tgs + 31) / 32) ? parts[lid] : 0.0;
-        v = simd_sum(v);
-        if (lid == 0) res[gid] += v;
-    }
+    if (simd_lid == 0) res[row_idx] += sum;
 }
 "#;
 
-/// Fused Q4_K matvec + residual add.
+/// Q4_K dequant matvec: y = W_q4k @ x.
+/// Q4_K: 256 values/block, 144 bytes/block (2B d, 2B dmin, 12B scales, 128B quants)
+/// Each simdgroup (32 threads) handles one row. Threadgroup processes num_sg rows.
+const MATVEC_Q4K: &str = r#"
+inline void get_scale_min_k4(int j, device const uchar *q, thread float &sc, thread float &mn) {
+    if (j < 4) { sc = float(q[j] & 63); mn = float(q[j + 4] & 63); }
+    else { sc = float((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4)); mn = float((q[j + 4] >> 4) | ((q[j] >> 6) << 4)); }
+}
+kernel void matvec_q4k(
+    device const uchar *W    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device float       *y    [[buffer(2)]],
+    constant uint      &cols [[buffer(3)]],
+    constant uint      &rows [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint num_sg [[simdgroups_per_threadgroup]]
+) {
+    uint row_idx = tgid * num_sg + simd_gid;
+    if (row_idx >= rows) return;
+    uint blocks_per_row = cols / 256;
+    device const uchar *row = W + row_idx * blocks_per_row * 144;
+    float sum = 0.0;
+    for (uint b = simd_lid; b < blocks_per_row; b += 32) {
+        device const uchar *blk = row + b * 144;
+        float d    = float(*((device const half *)(blk)));
+        float dmin = float(*((device const half *)(blk + 2)));
+        device const uchar *scales = blk + 4;
+        device const uchar *qs = blk + 16;
+        uint base = b * 256;
+        for (int pair = 0; pair < 4; pair++) {
+            int is0 = pair * 2, is1 = pair * 2 + 1;
+            float sc0, mn0, sc1, mn1;
+            get_scale_min_k4(is0, scales, sc0, mn0);
+            get_scale_min_k4(is1, scales, sc1, mn1);
+            float ds0 = d * sc0, dm0 = dmin * mn0;
+            float ds1 = d * sc1, dm1 = dmin * mn1;
+            device const uchar *qp = qs + pair * 32;
+            uint idx = base + pair * 64;
+            for (uint l = 0; l < 32; l++) {
+                uchar qb = qp[l];
+                sum += (ds0 * float(qb & 0xF) - dm0) * x[idx + l];
+                sum += (ds1 * float(qb >> 4)   - dm1) * x[idx + 32 + l];
+            }
+        }
+    }
+    sum = simd_sum(sum);
+    if (simd_lid == 0) y[row_idx] = sum;
+}
+"#;
+
+/// Fused Q4_K matvec + residual add. Simdgroup-per-row pattern.
 const MATVEC_Q4K_ADD: &str = r#"
 inline void get_scale_min_k4_add(int j, device const uchar *q, thread float &sc, thread float &mn) {
     if (j < 4) { sc = float(q[j] & 63); mn = float(q[j + 4] & 63); }
@@ -257,14 +312,18 @@ kernel void matvec_q4k_add(
     device const float *x    [[buffer(1)]],
     device float       *res  [[buffer(2)]],
     constant uint      &cols [[buffer(3)]],
-    uint gid [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]]
+    constant uint      &rows [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint num_sg [[simdgroups_per_threadgroup]]
 ) {
+    uint row_idx = tgid * num_sg + simd_gid;
+    if (row_idx >= rows) return;
     uint blocks_per_row = cols / 256;
-    device const uchar *row = W + gid * blocks_per_row * 144;
+    device const uchar *row = W + row_idx * blocks_per_row * 144;
     float sum = 0.0;
-    for (uint b = lid; b < blocks_per_row; b += tgs) {
+    for (uint b = simd_lid; b < blocks_per_row; b += 32) {
         device const uchar *blk = row + b * 144;
         float d    = float(*((device const half *)(blk)));
         float dmin = float(*((device const half *)(blk + 2)));
@@ -288,32 +347,29 @@ kernel void matvec_q4k_add(
         }
     }
     sum = simd_sum(sum);
-    threadgroup float parts[32];
-    if (lid % 32 == 0) parts[lid / 32] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 32) {
-        float v = (lid < (tgs + 31) / 32) ? parts[lid] : 0.0;
-        v = simd_sum(v);
-        if (lid == 0) res[gid] += v;
-    }
+    if (simd_lid == 0) res[row_idx] += sum;
 }
 "#;
 
-/// Fused Q6_K matvec + residual add.
+/// Fused Q6_K matvec + residual add. Simdgroup-per-row pattern.
 const MATVEC_Q6K_ADD: &str = r#"
 kernel void matvec_q6k_add(
     device const uchar *W    [[buffer(0)]],
     device const float *x    [[buffer(1)]],
     device float       *res  [[buffer(2)]],
     constant uint      &cols [[buffer(3)]],
-    uint gid [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint tgs [[threads_per_threadgroup]]
+    constant uint      &rows [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint num_sg [[simdgroups_per_threadgroup]]
 ) {
+    uint row_idx = tgid * num_sg + simd_gid;
+    if (row_idx >= rows) return;
     uint blocks_per_row = cols / 256;
-    device const uchar *row = W + gid * blocks_per_row * 210;
+    device const uchar *row = W + row_idx * blocks_per_row * 210;
     float sum = 0.0;
-    for (uint b = lid; b < blocks_per_row; b += tgs) {
+    for (uint b = simd_lid; b < blocks_per_row; b += 32) {
         device const uchar *blk = row + b * 210;
         device const uchar *ql = blk;
         device const uchar *qh = blk + 128;
@@ -342,14 +398,7 @@ kernel void matvec_q6k_add(
         }
     }
     sum = simd_sum(sum);
-    threadgroup float parts[32];
-    if (lid % 32 == 0) parts[lid / 32] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 32) {
-        float v = (lid < (tgs + 31) / 32) ? parts[lid] : 0.0;
-        v = simd_sum(v);
-        if (lid == 0) res[gid] += v;
-    }
+    if (simd_lid == 0) res[row_idx] += sum;
 }
 "#;
 
@@ -377,7 +426,7 @@ kernel void embed_q4_0(
 "#;
 
 /// Dequant single row from Q6_K embedding table.
-/// Launch with dim threads (1024 for Qwen3-0.6B).
+/// Launch with dim threads.
 const EMBED_Q6K: &str = r#"
 kernel void embed_q6k(
     device const uchar *W        [[buffer(0)]],
@@ -526,17 +575,6 @@ kernel void silu_mul(
 ) {
     float g = gate[gid];
     out[gid] = (g / (1.0 + exp(-g))) * up[gid];
-}
-"#;
-
-/// Residual add: x += y. Launch with dim threads.
-const RESIDUAL_ADD: &str = r#"
-kernel void residual_add(
-    device float       *x [[buffer(0)]],
-    device const float *y [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    x[gid] += y[gid];
 }
 "#;
 

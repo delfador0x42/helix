@@ -48,7 +48,9 @@ impl EmbeddingCache {
         }
         let tmp = dir.join("embeddings.bin.tmp");
         if std::fs::write(&tmp, &buf).is_ok() {
-            std::fs::rename(&tmp, &path).ok();
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                eprintln!("helix-bg: cache rename failed: {e}");
+            }
         }
     }
 

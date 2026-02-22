@@ -205,7 +205,7 @@ pub fn run_bandwidth_test() {
     let mv_src = matvec_kernel();
     let mv_lib = device.new_library_with_source(&mv_src)
         .expect("Failed to compile matvec shader");
-    // Qwen3-0.6B relevant sizes: hidden=1024, ffn=2816, vocab=151936
+    // Llama-3.2-1B relevant sizes: hidden=2048, ffn=8192, vocab=128256
     for &(rows, cols, label) in &[
         (1024u32,  1024,  "attn_proj 1024x1024"),
         (2816,     1024,  "ffn_up 2816x1024"),

@@ -958,12 +958,13 @@ fn tool_list() -> Value {
     ])
 }
 
-/// Copy release binary over installed binary, codesign, re-exec.
+/// Copy release binary over installed binary, codesign, fix MCP config, re-exec.
 fn do_reload() {
     use std::os::unix::process::CommandExt;
     let exe = match std::env::current_exe() { Ok(p) => p, Err(_) => return };
     let home = std::env::var("HOME").unwrap_or_default();
-    let src = std::path::PathBuf::from(&home).join("wudan/dojo/crash3/llm_double_helix/target/release/helix");
+    let src = std::path::PathBuf::from(&home)
+        .join("wudan/dojo/crash3/llm_double_helix/helix/target/release/helix");
     if src.exists() {
         let tmp = exe.with_extension("tmp");
         if std::fs::copy(&src, &tmp).is_ok() {
@@ -973,7 +974,41 @@ fn do_reload() {
             } else { let _ = std::fs::remove_file(&tmp); }
         }
     }
+    // Ensure ~/.claude.json MCP config points to the release binary
+    fix_mcp_config(&home, &src);
     let args: Vec<String> = std::env::args().skip(1).collect();
     let _err = std::process::Command::new(&exe).args(&args).exec();
     eprintln!("helix reload failed: {_err}");
+}
+
+/// Ensure ~/.claude.json mcpServers.helix.command points to the release binary.
+fn fix_mcp_config(home: &str, release_bin: &std::path::Path) {
+    let config_path = std::path::PathBuf::from(home).join(".claude.json");
+    let data = match std::fs::read_to_string(&config_path) { Ok(d) => d, Err(_) => return };
+    let expected = release_bin.to_string_lossy();
+    // Quick check: if the config already has the correct path, skip rewrite
+    if data.contains(expected.as_ref()) { return; }
+    // Parse, patch, write back. Minimal JSON surgery — find and replace the command value
+    // under mcpServers.helix. We avoid a JSON dep by doing targeted string replacement.
+    let needle = "\"command\":";
+    let helix_key = "\"helix\"";
+    // Find the helix server block
+    let helix_pos = match data.find(helix_key) { Some(p) => p, None => return };
+    // Find "command": after the helix key
+    let after_helix = &data[helix_pos..];
+    let cmd_offset = match after_helix.find(needle) { Some(p) => p, None => return };
+    let abs_cmd = helix_pos + cmd_offset + needle.len();
+    // Skip whitespace to find the opening quote of the command value
+    let rest = &data[abs_cmd..];
+    let quote_start = match rest.find('"') { Some(p) => p, None => return };
+    let val_start = abs_cmd + quote_start + 1; // after opening quote
+    let val_rest = &data[val_start..];
+    let quote_end = match val_rest.find('"') { Some(p) => p, None => return };
+    let old_cmd = &data[val_start..val_start + quote_end];
+    if old_cmd == expected.as_ref() { return; }
+    let mut patched = String::with_capacity(data.len() + 32);
+    patched.push_str(&data[..val_start]);
+    patched.push_str(&expected);
+    patched.push_str(&data[val_start + quote_end..]);
+    let _ = std::fs::write(&config_path, patched);
 }

@@ -1,5 +1,5 @@
 //! Loads GGUF weights into GPU buffers and compiles Metal pipelines.
-//! Supports Qwen3 (Q4_K/Q6_K) and Llama (Q4_0/Q4_K/Q6_K) architectures.
+//! Llama architecture only (Q4_0/Q4_1/Q4_K/Q6_K quantization types).
 
 use crate::gpu::*;
 use crate::gguf::{GGUFFile, GGMLType, ModelConfig};
@@ -33,14 +33,11 @@ pub struct Model {
     pub p_kv_store: Pipeline,
     pub p_attn: Pipeline,
     pub p_silu: Pipeline,
-    pub p_add: Pipeline,
     pub p_argmax: Pipeline,
     // Weight buffer (all tensor data, one big buffer)
     pub weights: Buffer,
-    pub tensor_data_start: usize,
     // Per-layer weight offsets (relative to tensor_data_start)
     pub layers: Vec<LayerOffsets>,
-    pub has_qk_norm: bool,   // true for Qwen3, false for Llama
     pub embd_off: u64,       // token_embd.weight offset
     pub embd_type: GGMLType, // quantization type of embeddings
     pub output_off: u64,     // output.weight offset (or embd_off if tied)
@@ -53,11 +50,9 @@ pub struct Model {
     pub k: Buffer,          // [kv_dim]
     pub v: Buffer,          // [kv_dim]
     pub attn_out: Buffer,   // [q_dim]
-    pub o: Buffer,          // [hidden_dim]
     pub gate: Buffer,       // [ffn_dim]
     pub up: Buffer,         // [ffn_dim]
     pub ffn_mid: Buffer,    // [ffn_dim]
-    pub down: Buffer,       // [hidden_dim]
     pub logits: Buffer,     // [vocab_size]
     pub argmax_buf: Buffer, // [1] u32 — GPU argmax result
     // KV cache: per layer
@@ -71,8 +66,6 @@ pub struct LayerOffsets {
     pub attn_v: u64,
     pub attn_output: u64,
     pub attn_norm: u64,
-    pub attn_q_norm: Option<u64>,
-    pub attn_k_norm: Option<u64>,
     pub ffn_gate: u64,
     pub ffn_up: u64,
     pub ffn_down: u64,
@@ -111,7 +104,6 @@ impl Model {
         let p_kv_store = device.new_compute_pipeline(&lib.get_function("kv_store")?)?;
         let p_attn = device.new_compute_pipeline(&lib.get_function("attention")?)?;
         let p_silu = device.new_compute_pipeline(&lib.get_function("silu_mul")?)?;
-        let p_add = device.new_compute_pipeline(&lib.get_function("residual_add")?)?;
         let p_argmax = device.new_compute_pipeline(&lib.get_function("argmax")?)?;
         eprintln!("model: shaders compiled");
 
@@ -148,16 +140,12 @@ impl Model {
             let (attn_v, attn_v_type) = get("attn_v.weight")?;
             let (attn_output, attn_output_type) = get("attn_output.weight")?;
             let (attn_norm, _) = get("attn_norm.weight")?;
-            // QK-norm is optional (Qwen3 has it, Llama does not)
-            let attn_q_norm = gguf.tensor(&format!("blk.{i}.attn_q_norm.weight")).map(|t| t.offset);
-            let attn_k_norm = gguf.tensor(&format!("blk.{i}.attn_k_norm.weight")).map(|t| t.offset);
             let (ffn_gate, ffn_gate_type) = get("ffn_gate.weight")?;
             let (ffn_up, ffn_up_type) = get("ffn_up.weight")?;
             let (ffn_down, ffn_down_type) = get("ffn_down.weight")?;
             let (ffn_norm, _) = get("ffn_norm.weight")?;
             layers.push(LayerOffsets {
                 attn_q, attn_k, attn_v, attn_output, attn_norm,
-                attn_q_norm, attn_k_norm,
                 ffn_gate, ffn_up, ffn_down, ffn_norm,
                 attn_q_type, attn_k_type, attn_v_type, attn_output_type,
                 ffn_gate_type, ffn_up_type, ffn_down_type,
@@ -167,15 +155,14 @@ impl Model {
         let embd = gguf.tensor("token_embd.weight").ok_or("missing token_embd.weight")?;
         let embd_type = embd.dtype;
         let out_norm = gguf.tensor("output_norm.weight").ok_or("missing output_norm.weight")?;
-        // output.weight: separate tensor (Llama) or tied to token_embd (Qwen3)
+        // Tied weights fallback: many Llama models share token_embd as output projection
         let (output_off, output_type) = if let Some(out) = gguf.tensor("output.weight") {
             (out.offset, out.dtype)
         } else {
-            (embd.offset, embd.dtype) // tied weights
+            eprintln!("model: output.weight not found, using tied embeddings (token_embd.weight)");
+            (embd.offset, embd.dtype)
         };
-        let has_qk_norm = layers.first().map(|l| l.attn_q_norm.is_some()).unwrap_or(false);
-        eprintln!("model: has_qk_norm={has_qk_norm}, embd_type={:?}, output_type={:?}, tied={}",
-            embd_type, output_type, gguf.tensor("output.weight").is_none());
+        eprintln!("model: embd_type={:?}, output_type={:?}", embd_type, output_type);
 
         // Scratch buffers
         let f = |n: u32| device.new_buffer(n as u64 * 4);
@@ -185,11 +172,9 @@ impl Model {
         let k_buf = f(kv_dim);
         let v_buf = f(kv_dim);
         let attn_out = f(q_dim);
-        let o = f(cfg.hidden_dim);
         let gate = f(cfg.ffn_dim);
         let up = f(cfg.ffn_dim);
         let ffn_mid = f(cfg.ffn_dim);
-        let down = f(cfg.hidden_dim);
         let logits = f(cfg.vocab_size);
         let argmax_buf = device.new_buffer(4); // single u32
 
@@ -210,14 +195,13 @@ impl Model {
             p_rmsnorm, p_q4_0, p_q4_1, p_q4k, p_q6k,
             p_q4_0_add, p_q4_1_add, p_q4k_add, p_q6k_add,
             p_embed_q4_0, p_embed_q6k,
-            p_rope, p_kv_store, p_attn, p_silu, p_add, p_argmax,
-            weights, tensor_data_start: td_start,
-            has_qk_norm, layers,
+            p_rope, p_kv_store, p_attn, p_silu, p_argmax,
+            weights, layers,
             embd_off: embd.offset, embd_type,
             output_off, output_type,
             out_norm_off: out_norm.offset,
-            x, norm_out, q: q_buf, k: k_buf, v: v_buf, attn_out, o,
-            gate, up, ffn_mid, down, logits, argmax_buf,
+            x, norm_out, q: q_buf, k: k_buf, v: v_buf, attn_out,
+            gate, up, ffn_mid, logits, argmax_buf,
             k_cache, v_cache,
         })
     }

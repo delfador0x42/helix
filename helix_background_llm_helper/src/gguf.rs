@@ -409,21 +409,9 @@ impl GGUFFile {
         })
     }
 
-    /// Get raw bytes for a tensor (zero-copy from mmap).
-    pub fn tensor_data(&self, info: &TensorInfo) -> &[u8] {
-        let start = self.tensor_data_start + info.offset as usize;
-        let end = start + info.byte_size() as usize;
-        &self.data[start..end]
-    }
-
     /// Find tensor by name.
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
         self.tensors.iter().find(|t| t.name == name)
-    }
-
-    /// Get metadata value by key.
-    pub fn meta(&self, key: &str) -> Option<&MetaValue> {
-        self.metadata.get(key)
     }
 }
 

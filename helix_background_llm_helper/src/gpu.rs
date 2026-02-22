@@ -274,7 +274,9 @@ impl Device {
             );
             release(opts);
             release(src);
-            if lib.is_null() || !err.is_null() {
+            // Only check lib.is_null() — Metal returns non-null error for
+            // warnings even when compilation succeeds.
+            if lib.is_null() {
                 let desc = if !err.is_null() {
                     nsstring_to_str(msg_id(err, sel("localizedDescription\0")))
                 } else { "unknown".into() };

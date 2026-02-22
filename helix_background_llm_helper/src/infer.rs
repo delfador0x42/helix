@@ -1,4 +1,4 @@
-//! Transformer forward pass (Qwen3 / Llama / generic decoder-only).
+//! Transformer forward pass (Llama decoder-only).
 //! Single encoder per forward pass — all dispatches in one encoder.
 //! Metal handles implicit barriers between dependent dispatches.
 
@@ -28,11 +28,6 @@ pub fn forward(model: &Model, token_id: u32, position: u32) {
         // Q/K/V projections
         dispatch_qkv(&enc, model, lo);
 
-        // QK-norm (Qwen3 only)
-        if model.has_qk_norm {
-            dispatch_qk_norm(&enc, model, lo);
-        }
-
         // RoPE on Q and K
         dispatch_rope(&enc, model, position);
 
@@ -44,8 +39,7 @@ pub fn forward(model: &Model, token_id: u32, position: u32) {
 
         // Output projection + residual: attn_out → o, x += o
         dispatch_matvec_add(&enc, model, lo.attn_output_type, lo.attn_output,
-            &model.attn_out, &model.o, model.q_dim, cfg.hidden_dim,
-            &model.x);
+            &model.attn_out, model.q_dim, cfg.hidden_dim, &model.x);
 
         // FFN RMSNorm
         dispatch_rmsnorm(&enc, model, &model.x, &model.norm_out, lo.ffn_norm);
@@ -58,8 +52,7 @@ pub fn forward(model: &Model, token_id: u32, position: u32) {
 
         // FFN down + residual: ffn_mid → down, x += down
         dispatch_matvec_add(&enc, model, lo.ffn_down_type, lo.ffn_down,
-            &model.ffn_mid, &model.down, cfg.ffn_dim, cfg.hidden_dim,
-            &model.x);
+            &model.ffn_mid, cfg.ffn_dim, cfg.hidden_dim, &model.x);
     }
 
     // Final RMSNorm
@@ -158,20 +151,6 @@ pub fn forward_timed(model: &Model, token_id: u32, position: u32) -> TimingBreak
         }
         t.qkv_us += t0.elapsed().as_micros() as u64;
 
-        // QK-norm
-        if model.has_qk_norm {
-            let t0 = Instant::now();
-            {
-                let cmd = model.queue.new_command_buffer();
-                let enc = cmd.new_compute_encoder();
-                dispatch_qk_norm(&enc, model, lo);
-                enc.end_encoding();
-                cmd.commit();
-                cmd.wait_until_completed();
-            }
-            t.qk_norm_us += t0.elapsed().as_micros() as u64;
-        }
-
         // RoPE
         let t0 = Instant::now();
         {
@@ -214,7 +193,7 @@ pub fn forward_timed(model: &Model, token_id: u32, position: u32) -> TimingBreak
             let cmd = model.queue.new_command_buffer();
             let enc = cmd.new_compute_encoder();
             dispatch_matvec_add(&enc, model, lo.attn_output_type, lo.attn_output,
-                &model.attn_out, &model.o, model.q_dim, cfg.hidden_dim, &model.x);
+                &model.attn_out, model.q_dim, cfg.hidden_dim, &model.x);
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
@@ -263,7 +242,7 @@ pub fn forward_timed(model: &Model, token_id: u32, position: u32) -> TimingBreak
             let cmd = model.queue.new_command_buffer();
             let enc = cmd.new_compute_encoder();
             dispatch_matvec_add(&enc, model, lo.ffn_down_type, lo.ffn_down,
-                &model.ffn_mid, &model.down, cfg.ffn_dim, cfg.hidden_dim, &model.x);
+                &model.ffn_mid, cfg.ffn_dim, cfg.hidden_dim, &model.x);
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
@@ -316,7 +295,6 @@ pub struct TimingBreakdown {
     pub embed_us: u64,
     pub rmsnorm_us: u64,
     pub qkv_us: u64,
-    pub qk_norm_us: u64,
     pub rope_us: u64,
     pub kv_store_us: u64,
     pub attn_us: u64,
@@ -330,7 +308,7 @@ pub struct TimingBreakdown {
 
 impl TimingBreakdown {
     pub fn total_us(&self) -> u64 {
-        self.embed_us + self.rmsnorm_us + self.qkv_us + self.qk_norm_us
+        self.embed_us + self.rmsnorm_us + self.qkv_us
             + self.rope_us + self.kv_store_us + self.attn_us + self.attn_proj_us
             + self.ffn_proj_us + self.silu_us + self.ffn_down_us
             + self.output_proj_us + self.argmax_us
@@ -343,9 +321,6 @@ impl TimingBreakdown {
         eprintln!("  │ embed:       {:>6}µs  ({:>5.1}%)                             │", self.embed_us, pct(self.embed_us));
         eprintln!("  │ rmsnorm:     {:>6}µs  ({:>5.1}%)  [all {} calls]              │", self.rmsnorm_us, pct(self.rmsnorm_us), "33");
         eprintln!("  │ qkv matvec:  {:>6}µs  ({:>5.1}%)                             │", self.qkv_us, pct(self.qkv_us));
-        if self.qk_norm_us > 0 {
-            eprintln!("  │ qk_norm:     {:>6}µs  ({:>5.1}%)                             │", self.qk_norm_us, pct(self.qk_norm_us));
-        }
         eprintln!("  │ rope:        {:>6}µs  ({:>5.1}%)                             │", self.rope_us, pct(self.rope_us));
         eprintln!("  │ kv_store:    {:>6}µs  ({:>5.1}%)                             │", self.kv_store_us, pct(self.kv_store_us));
         eprintln!("  │ attention:   {:>6}µs  ({:>5.1}%)                             │", self.attn_us, pct(self.attn_us));
@@ -400,55 +375,49 @@ fn dispatch_rmsnorm(enc: &ComputeEncoder, m: &Model, x: &Buffer, y: &Buffer, wei
 
 fn dispatch_qkv(enc: &ComputeEncoder, m: &Model, lo: &crate::model::LayerOffsets) {
     let h = m.cfg.hidden_dim;
-    // Q
+    // Q: [q_dim × hidden_dim] @ norm_out → q
     enc.set_pipeline(m.matvec_pipeline(lo.attn_q_type));
     enc.set_buffer(0, &m.weights, lo.attn_q);
     enc.set_buffer(1, &m.norm_out, 0);
     enc.set_buffer(2, &m.q, 0);
     enc.set_bytes(3, &h as *const u32 as *const c_void, 4);
-    let q_tgs = MTLSize::new(matvec_tgs(lo.attn_q_type, h), 1, 1);
-    enc.dispatch_threadgroups(MTLSize::new(m.q_dim as u64, 1, 1), q_tgs);
-    // K
+    let q_rows = m.q_dim;
+    enc.set_bytes(4, &q_rows as *const u32 as *const c_void, 4);
+    let q_tgs = matvec_tgs(lo.attn_q_type, h);
+    let q_sg = (q_tgs / 32) as u32;
+    enc.dispatch_threadgroups(
+        MTLSize::new(((q_rows + q_sg - 1) / q_sg) as u64, 1, 1),
+        MTLSize::new(q_tgs, 1, 1),
+    );
+    // K: [kv_dim × hidden_dim] @ norm_out → k
     if lo.attn_k_type != lo.attn_q_type {
         enc.set_pipeline(m.matvec_pipeline(lo.attn_k_type));
     }
     enc.set_buffer(0, &m.weights, lo.attn_k);
     enc.set_buffer(2, &m.k, 0);
-    let k_tgs = MTLSize::new(matvec_tgs(lo.attn_k_type, h), 1, 1);
-    enc.dispatch_threadgroups(MTLSize::new(m.kv_dim as u64, 1, 1), k_tgs);
-    // V
+    let kv_rows = m.kv_dim;
+    enc.set_bytes(4, &kv_rows as *const u32 as *const c_void, 4);
+    let k_tgs = matvec_tgs(lo.attn_k_type, h);
+    let k_sg = (k_tgs / 32) as u32;
+    enc.dispatch_threadgroups(
+        MTLSize::new(((kv_rows + k_sg - 1) / k_sg) as u64, 1, 1),
+        MTLSize::new(k_tgs, 1, 1),
+    );
+    // V: [kv_dim × hidden_dim] @ norm_out → v
     if lo.attn_v_type != lo.attn_k_type {
         enc.set_pipeline(m.matvec_pipeline(lo.attn_v_type));
     }
     enc.set_buffer(0, &m.weights, lo.attn_v);
     enc.set_buffer(2, &m.v, 0);
-    enc.dispatch_threadgroups(MTLSize::new(m.kv_dim as u64, 1, 1), k_tgs);
-}
-
-fn dispatch_qk_norm(enc: &ComputeEncoder, m: &Model, lo: &crate::model::LayerOffsets) {
-    let hd = m.head_dim;
-    let eps = m.cfg.rms_norm_eps;
-    let q_norm_off = lo.attn_q_norm.unwrap();
-    let k_norm_off = lo.attn_k_norm.unwrap();
-    enc.set_pipeline(&m.p_rmsnorm);
-    // Q heads — all dispatches in same encoder (no encoder creation overhead)
-    for head in 0..m.cfg.n_heads {
-        enc.set_buffer(0, &m.q, (head * hd * 4) as u64);
-        enc.set_buffer(1, &m.q, (head * hd * 4) as u64);
-        enc.set_buffer(2, &m.weights, q_norm_off);
-        enc.set_bytes(3, &hd as *const u32 as *const c_void, 4);
-        enc.set_bytes(4, &eps as *const f32 as *const c_void, 4);
-        enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(128, 1, 1));
-    }
-    // K heads
-    for head in 0..m.cfg.n_kv_heads {
-        enc.set_buffer(0, &m.k, (head * hd * 4) as u64);
-        enc.set_buffer(1, &m.k, (head * hd * 4) as u64);
-        enc.set_buffer(2, &m.weights, k_norm_off);
-        enc.set_bytes(3, &hd as *const u32 as *const c_void, 4);
-        enc.set_bytes(4, &eps as *const f32 as *const c_void, 4);
-        enc.dispatch_threadgroups(MTLSize::new(1, 1, 1), MTLSize::new(128, 1, 1));
-    }
+    // kv_rows already set in buffer(4) from K dispatch
+    let v_tgs = if lo.attn_v_type != lo.attn_k_type {
+        matvec_tgs(lo.attn_v_type, h)
+    } else { k_tgs };
+    let v_sg = (v_tgs / 32) as u32;
+    enc.dispatch_threadgroups(
+        MTLSize::new(((kv_rows + v_sg - 1) / v_sg) as u64, 1, 1),
+        MTLSize::new(v_tgs, 1, 1),
+    );
 }
 
 fn dispatch_matvec(
@@ -460,8 +429,11 @@ fn dispatch_matvec(
     enc.set_buffer(1, x, 0);
     enc.set_buffer(2, y, 0);
     enc.set_bytes(3, &cols as *const u32 as *const c_void, 4);
-    let tgs = MTLSize::new(matvec_tgs(dtype, cols), 1, 1);
-    enc.dispatch_threadgroups(MTLSize::new(rows as u64, 1, 1), tgs);
+    enc.set_bytes(4, &rows as *const u32 as *const c_void, 4);
+    let tgs = matvec_tgs(dtype, cols);
+    let rows_per_tg = (tgs / 32) as u32; // simdgroups per threadgroup
+    let grid = ((rows + rows_per_tg - 1) / rows_per_tg) as u64;
+    enc.dispatch_threadgroups(MTLSize::new(grid, 1, 1), MTLSize::new(tgs, 1, 1));
 }
 
 fn dispatch_rope(enc: &ComputeEncoder, m: &Model, position: u32) {
@@ -524,37 +496,50 @@ fn dispatch_silu(enc: &ComputeEncoder, m: &Model, dim: u32) {
 
 fn dispatch_matvec_add(
     enc: &ComputeEncoder, m: &Model, dtype: GGMLType, weight_off: u64,
-    x: &Buffer, _y: &Buffer, cols: u32, rows: u32, residual: &Buffer,
+    x: &Buffer, cols: u32, rows: u32, residual: &Buffer,
 ) {
-    // Fused matvec + residual add: residual[gid] += dot(W[gid], x)
+    // Fused matvec + residual add: residual[row] += dot(W[row], x)
+    // Same simdgroup-per-row dispatch as non-fused matvec.
     enc.set_pipeline(m.matvec_add_pipeline(dtype));
     enc.set_buffer(0, &m.weights, weight_off);
     enc.set_buffer(1, x, 0);
     enc.set_buffer(2, residual, 0);
     enc.set_bytes(3, &cols as *const u32 as *const c_void, 4);
-    let tgs = MTLSize::new(matvec_tgs(dtype, cols), 1, 1);
-    enc.dispatch_threadgroups(MTLSize::new(rows as u64, 1, 1), tgs);
+    enc.set_bytes(4, &rows as *const u32 as *const c_void, 4);
+    let tgs = matvec_tgs(dtype, cols);
+    let rows_per_tg = (tgs / 32) as u32; // simdgroups per threadgroup
+    let grid = ((rows + rows_per_tg - 1) / rows_per_tg) as u64;
+    enc.dispatch_threadgroups(MTLSize::new(grid, 1, 1), MTLSize::new(tgs, 1, 1));
 }
 
 fn dispatch_gate_up(enc: &ComputeEncoder, m: &Model, lo: &crate::model::LayerOffsets) {
     let h = m.cfg.hidden_dim;
-    let grid = MTLSize::new(m.cfg.ffn_dim as u64, 1, 1);
-    // Gate
+    let ffn_rows = m.cfg.ffn_dim;
+    // Gate: [ffn_dim × hidden_dim] @ norm_out → gate
     enc.set_pipeline(m.matvec_pipeline(lo.ffn_gate_type));
     enc.set_buffer(0, &m.weights, lo.ffn_gate);
     enc.set_buffer(1, &m.norm_out, 0);
     enc.set_buffer(2, &m.gate, 0);
     enc.set_bytes(3, &h as *const u32 as *const c_void, 4);
-    let gate_tgs = MTLSize::new(matvec_tgs(lo.ffn_gate_type, h), 1, 1);
-    enc.dispatch_threadgroups(grid, gate_tgs);
-    // Up
+    enc.set_bytes(4, &ffn_rows as *const u32 as *const c_void, 4);
+    let gate_tgs = matvec_tgs(lo.ffn_gate_type, h);
+    let gate_sg = (gate_tgs / 32) as u32;
+    let gate_grid = ((ffn_rows + gate_sg - 1) / gate_sg) as u64;
+    enc.dispatch_threadgroups(MTLSize::new(gate_grid, 1, 1), MTLSize::new(gate_tgs, 1, 1));
+    // Up: [ffn_dim × hidden_dim] @ norm_out → up
     if lo.ffn_up_type != lo.ffn_gate_type {
         enc.set_pipeline(m.matvec_pipeline(lo.ffn_up_type));
     }
     enc.set_buffer(0, &m.weights, lo.ffn_up);
     enc.set_buffer(2, &m.up, 0);
-    let up_tgs = MTLSize::new(matvec_tgs(lo.ffn_up_type, h), 1, 1);
-    enc.dispatch_threadgroups(grid, up_tgs);
+    let up_tgs = matvec_tgs(lo.ffn_up_type, h);
+    let up_sg = (up_tgs / 32) as u32;
+    // ffn_rows already in buffer(4) if same tgs, re-set if different
+    if up_tgs != gate_tgs {
+        enc.set_bytes(4, &ffn_rows as *const u32 as *const c_void, 4);
+    }
+    let up_grid = ((ffn_rows + up_sg - 1) / up_sg) as u64;
+    enc.dispatch_threadgroups(MTLSize::new(up_grid, 1, 1), MTLSize::new(up_tgs, 1, 1));
 }
 
 fn dispatch_argmax(enc: &ComputeEncoder, m: &Model) {

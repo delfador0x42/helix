@@ -50,20 +50,16 @@ impl Tokenizer {
         let chars: Vec<char> = word.chars().collect();
         if chars.is_empty() { return vec![]; }
         let mut tokens = Vec::new();
+        let mut buf = String::new();
         let mut start = 0;
         while start < chars.len() {
             let mut end = chars.len();
             let mut found = false;
             while start < end {
-                let sub: String = if start == 0 {
-                    chars[start..end].iter().collect()
-                } else {
-                    let mut s = String::with_capacity(2 + (end - start) * 4);
-                    s.push_str("##");
-                    s.extend(&chars[start..end]);
-                    s
-                };
-                if let Some(&id) = self.vocab.get(&sub) {
+                buf.clear();
+                if start > 0 { buf.push_str("##"); }
+                buf.extend(&chars[start..end]);
+                if let Some(&id) = self.vocab.get(buf.as_str()) {
                     tokens.push(id);
                     start = end;
                     found = true;

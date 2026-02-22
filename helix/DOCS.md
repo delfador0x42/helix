@@ -1,8 +1,8 @@
 # Helix Documentation
 
-Helix is a persistent knowledge base designed for AI coding assistants. It runs as an MCP (Model Context Protocol) server alongside Claude Code, providing 7 tools for storing, searching, and retrieving knowledge across sessions. A companion hook system injects relevant context before every file operation with zero perceptible latency.
+Helix is a persistent knowledge base designed for AI coding assistants. It runs as an MCP (Model Context Protocol) server alongside Claude Code, providing 9 tools for storing, searching, retrieving, and analyzing knowledge across sessions. A companion hook system injects relevant context before every file operation with zero perceptible latency.
 
-**Key numbers:** ~4,700 lines of Rust, 18 source files, 7 MCP tools, 9 hook types, zero external dependencies.
+**Key numbers:** ~6,300 lines of Rust, 19 source files, 9 MCP tools, 9 hook types, zero external dependencies.
 
 ---
 
@@ -136,7 +136,7 @@ Hooks are defined in `.claude/settings.json`. The `helix hooks install` command 
 
 ## MCP Tools Reference
 
-Helix exposes 7 MCP tools via the JSON-RPC stdio protocol. Each tool is designed for LLM consumption — outputs are compressed, context-efficient, and structured for immediate use.
+Helix exposes 9 MCP tools via the JSON-RPC stdio protocol. Each tool is designed for LLM consumption — outputs are compressed, context-efficient, and structured for immediate use.
 
 ### store
 

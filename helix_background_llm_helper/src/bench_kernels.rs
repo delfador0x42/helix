@@ -335,6 +335,62 @@ pub fn run() {
         enc.dispatch_threadgroups(MTLSize::new(vocab_tgs as u64, 1, 1), MTLSize::new(256, 1, 1));
     });
 
+    // ── Batch matmul Q4_0 ──
+    eprintln!("\n--- Batch Matmul (simdgroup_float8x8 tiled) ---");
+    {
+        let batch_src = crate::kernels_batch::all_batch_kernels();
+        let batch_lib = dev.new_library_with_source(&batch_src).unwrap();
+        let p_bm_q4_0 = dev.new_compute_pipeline(
+            &batch_lib.get_function("matmul_q4_0").unwrap()).unwrap();
+
+        // Test at various batch sizes with Llama-1B dimensions
+        // Q proj: [2048 × 2048] @ X[2048 × B] → Y[2048 × B]
+        for b in [1u32, 4, 8, 16, 25, 32, 64] {
+            let x_batch = dev.new_buffer(hidden as u64 * b as u64 * 4);
+            let y_batch = dev.new_buffer(hidden as u64 * b as u64 * 4);
+            let rows_val = hidden;
+            let cols_val = hidden;
+            bench(&format!("matmul_q4_0 [{hidden}x{hidden}] B={b}"), ITERS, &queue, |enc| {
+                enc.set_pipeline(&p_bm_q4_0);
+                enc.set_buffer(0, &w_q4_0_2048x2048, 0);
+                enc.set_buffer(1, &x_batch, 0);
+                enc.set_buffer(2, &y_batch, 0);
+                enc.set_bytes(3, &cols_val as *const u32 as *const c_void, 4);
+                enc.set_bytes(4, &rows_val as *const u32 as *const c_void, 4);
+                enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+                let grid_x = (rows_val + 31) / 32;
+                let grid_y = (b + 31) / 32;
+                enc.dispatch_threadgroups(
+                    MTLSize::new(grid_x as u64, grid_y as u64, 1),
+                    MTLSize::new(128, 1, 1), // 4 simdgroups × 32 threads
+                );
+            });
+        }
+
+        // FFN gate: [8192 × 2048] @ X[2048 × B] → Y[8192 × B]
+        for b in [1u32, 8, 25, 32] {
+            let x_batch = dev.new_buffer(hidden as u64 * b as u64 * 4);
+            let y_batch = dev.new_buffer(ffn as u64 * b as u64 * 4);
+            let rows_val = ffn;
+            let cols_val = hidden;
+            bench(&format!("matmul_q4_0 [{ffn}x{hidden}] B={b}"), ITERS, &queue, |enc| {
+                enc.set_pipeline(&p_bm_q4_0);
+                enc.set_buffer(0, &w_q4_0_8192x2048, 0);
+                enc.set_buffer(1, &x_batch, 0);
+                enc.set_buffer(2, &y_batch, 0);
+                enc.set_bytes(3, &cols_val as *const u32 as *const c_void, 4);
+                enc.set_bytes(4, &rows_val as *const u32 as *const c_void, 4);
+                enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+                let grid_x = (rows_val + 31) / 32;
+                let grid_y = (b + 31) / 32;
+                enc.dispatch_threadgroups(
+                    MTLSize::new(grid_x as u64, grid_y as u64, 1),
+                    MTLSize::new(64, 1, 1),
+                );
+            });
+        }
+    }
+
     // ── Raw bandwidth test: just read N bytes through a kernel ──
     eprintln!("\n--- Raw Bandwidth ---");
     for mb in [10, 100, 500, 745] {

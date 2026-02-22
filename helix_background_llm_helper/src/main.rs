@@ -15,6 +15,7 @@ mod model;
 mod infer;
 mod bench_dispatch;
 mod bench_kernels;
+mod kernels_batch;
 
 use std::path::{Path, PathBuf};
 
@@ -186,46 +187,6 @@ fn load_model(path_arg: Option<&String>) {
             t.name, t.dims, t.n_elements(), bytes as f64 / 1e6, t.dtype);
     }
     eprintln!("\nTotal weight data: {:.1}MB", total_bytes as f64 / 1e6);
-}
-
-#[allow(dead_code)]
-fn cpu_dequant_q6k_row(data: &[u8], row: usize, dim: usize) -> Vec<f32> {
-    let bpr = dim / 256;
-    let row_bytes = bpr * 210;
-    let row_data = &data[row * row_bytes..];
-    let mut out = vec![0.0f32; dim];
-
-    for b in 0..bpr {
-        let blk = &row_data[b * 210..];
-        let ql = &blk[0..128];
-        let qh = &blk[128..192];
-        let scales = &blk[192..208]; // int8_t
-        let d = gguf::f16_to_f32(u16::from_le_bytes([blk[208], blk[209]]));
-        let base = b * 256;
-
-        for n in 0..2u32 {
-            let sb = (n * 8) as usize;
-            let ql_off = (n * 64) as usize;
-            let qh_off = (n * 32) as usize;
-            for l in 0..32usize {
-                let is = l / 16; // 0 for l=0..15, 1 for l=16..31
-                let s0 = d * (scales[sb + is] as i8 as f32);
-                let s2 = d * (scales[sb + is + 2] as i8 as f32);
-                let s4 = d * (scales[sb + is + 4] as i8 as f32);
-                let s6 = d * (scales[sb + is + 6] as i8 as f32);
-                let q1 = ((ql[ql_off + l] & 0xF) | (((qh[qh_off + l] >> 0) & 3) << 4)) as i32 - 32;
-                let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
-                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
-                let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
-                let idx = base + (n as usize) * 128;
-                out[idx + l] = s0 * q1 as f32;
-                out[idx + 32 + l] = s2 * q2 as f32;
-                out[idx + 64 + l] = s4 * q3 as f32;
-                out[idx + 96 + l] = s6 * q4 as f32;
-            }
-        }
-    }
-    out
 }
 
 fn run_generate(path_arg: Option<&String>) {

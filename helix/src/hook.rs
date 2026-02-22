@@ -132,6 +132,7 @@ fn session(input: &str, dir: &Path) -> Result<String, String> {
         msg.push_str(" ("); crate::text::itoa_push(&mut msg, *count as u32); msg.push(')');
     }
     msg.push_str("\nBEFORE starting work, call mcp__helix__search with keywords relevant to your task.");
+    msg.push_str("\nDISCIPLINE: Externalize reasoning through helix store calls every 2-3 steps. Do not think silently for extended periods — store intermediate design thoughts, not just final results.");
     Ok(hook_output(&msg))
 }
 
