@@ -634,6 +634,45 @@ fn dispatch_topics(args: Option<&Value>, dir: &Path) -> Result<String, String> {
             for entry in log.iter() { out.push_str("  "); out.push_str(entry); out.push('\n'); }
             Ok(out)
         }
+        "checkpoint" => {
+            let task = arg(args, "task");
+            if task.is_empty() { return Err("task required for checkpoint".into()); }
+            let mut cp = crate::session::Checkpoint::new(task);
+            let done = arg(args, "done");
+            if !done.is_empty() {
+                cp.done = done.split(';').map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()).collect();
+            }
+            let next = arg(args, "next");
+            if !next.is_empty() {
+                cp.next = next.split(';').map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()).collect();
+            }
+            let hyp = arg(args, "hypotheses");
+            if !hyp.is_empty() {
+                cp.hypotheses = hyp.split(';').map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()).collect();
+            }
+            let blocked = arg(args, "blocked");
+            if !blocked.is_empty() { cp.blocked = blocked.to_string(); }
+            let files = arg(args, "files");
+            if !files.is_empty() {
+                cp.files = files.split(',').map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()).collect();
+            }
+            cp.save(dir)?;
+            Ok(format!("checkpoint saved: {task}"))
+        }
+        "resume" => {
+            match crate::session::Checkpoint::load(dir) {
+                Some(cp) => Ok(cp.format_resume()),
+                None => Ok("no checkpoint found".into()),
+            }
+        }
+        "clear_checkpoint" => {
+            crate::session::Checkpoint::clear(dir);
+            Ok("checkpoint cleared".into())
+        }
         _ => {
             // Default: list topics
             crate::cache::with_corpus(dir, |cached| {
@@ -797,14 +836,20 @@ fn tool_list() -> Value {
               ("into", "string", "Target topic to merge INTO (merge action)")]),
         tool("topics", "Browse & maintain knowledge base. Default: list all topics. Use action param for other operations.",
             &[],
-            &[("action", "string", "Operation: list(default)|recent|entries|stats|xref|graph|stale|prune|compact|export|import|reindex|session"),
+            &[("action", "string", "Operation: list(default)|recent|entries|stats|xref|graph|stale|prune|compact|export|import|reindex|session|checkpoint|resume|clear_checkpoint"),
               ("topic", "string", "Topic name (for entries/xref)"), ("days", "string", "Number of days (default: 7 for recent, 30 for prune)"),
               ("hours", "string", "Number of hours (overrides days for recent)"),
               ("detail", "string", "Output: default|'tags'|'index' (for stats action)"),
               ("index", "string", "Entry index (for entries action)"), ("match_str", "string", "Filter entries matching substring"),
               ("focus", "string", "Glob pattern to filter topics (graph action)"),
               ("json", "string", "JSON string to import (import action)"),
-              ("refresh", "string", "Set to 'true' to show stale entries + current source (stale action)")]),
+              ("refresh", "string", "Set to 'true' to show stale entries + current source (stale action)"),
+              ("task", "string", "Task description for checkpoint (required for checkpoint action)"),
+              ("done", "string", "Semicolon-separated completed steps for checkpoint"),
+              ("next", "string", "Semicolon-separated next steps for checkpoint"),
+              ("hypotheses", "string", "Semicolon-separated working hypotheses for checkpoint"),
+              ("blocked", "string", "What's blocking progress for checkpoint"),
+              ("files", "string", "Comma-separated key files for checkpoint")]),
         tool("_reload", "Re-exec the server binary to pick up code changes.", &[], &[]),
     ])
 }
