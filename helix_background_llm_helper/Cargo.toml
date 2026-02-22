@@ -1,0 +1,19 @@
+[package]
+name = "helix-bg"
+version = "0.1.0"
+edition = "2021"
+description = "Background intelligence daemon for helix knowledge base. Embeds entries, finds patterns."
+
+[[bin]]
+name = "helix-bg"
+path = "src/main.rs"
+
+[dependencies]
+ort = { version = "=2.0.0-rc.10", features = ["coreml"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
