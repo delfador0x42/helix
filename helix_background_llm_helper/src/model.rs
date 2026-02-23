@@ -1,8 +1,10 @@
 //! Loads GGUF weights into GPU buffers and compiles Metal pipelines.
 //! Llama architecture only (Q4_0/Q4_1/Q4_K/Q6_K quantization types).
+//! Pre-dequantizes all weight tensors to FP16 at load time for MMA matmul.
 
 use crate::gpu::*;
 use crate::gguf::{GGUFFile, GGMLType, ModelConfig};
+use crate::kernels_fp16;
 use crate::kernels;
 use std::ffi::c_void;
 
@@ -16,13 +18,12 @@ pub struct Model {
     pub q_dim: u32,        // n_heads * head_dim
     pub device: Device,
     pub queue: CommandQueue,
-    // Pipelines
+    // Single-token pipelines
     pub p_rmsnorm: Pipeline,
     pub p_q4_0: Pipeline,
     pub p_q4_1: Pipeline,
     pub p_q4k: Pipeline,
     pub p_q6k: Pipeline,
-    // Fused matvec + residual add (res[gid] += dot(W[gid], x))
     pub p_q4_0_add: Pipeline,
     pub p_q4_1_add: Pipeline,
     pub p_q4k_add: Pipeline,
@@ -34,29 +35,33 @@ pub struct Model {
     pub p_attn: Pipeline,
     pub p_silu: Pipeline,
     pub p_argmax: Pipeline,
-    // Weight buffer (all tensor data, one big buffer)
+    // Quantized weight buffer (kept for norm weights which are F32)
     pub weights: Buffer,
-    // Per-layer weight offsets (relative to tensor_data_start)
+    // FP16 pre-dequantized weight buffer (row-major, all weight tensors expanded)
+    pub fp16_buf: Buffer,
+    pub fp16_embd_off: u64,
+    pub fp16_output_off: u64,
+    // Per-layer weight offsets
     pub layers: Vec<LayerOffsets>,
-    pub embd_off: u64,       // token_embd.weight offset
-    pub embd_type: GGMLType, // quantization type of embeddings
-    pub output_off: u64,     // output.weight offset (or embd_off if tied)
-    pub output_type: GGMLType, // quantization type of output projection
-    pub out_norm_off: u64,   // output_norm.weight offset
-    // Scratch buffers
-    pub x: Buffer,          // [hidden_dim] current hidden state
-    pub norm_out: Buffer,   // [hidden_dim] after rmsnorm
-    pub q: Buffer,          // [q_dim]
-    pub k: Buffer,          // [kv_dim]
-    pub v: Buffer,          // [kv_dim]
-    pub attn_out: Buffer,   // [q_dim]
-    pub gate: Buffer,       // [ffn_dim]
-    pub up: Buffer,         // [ffn_dim]
-    pub ffn_mid: Buffer,    // [ffn_dim]
-    pub logits: Buffer,     // [vocab_size]
-    pub argmax_buf: Buffer, // [1] u32 — GPU argmax result
-    // KV cache: per layer
-    pub k_cache: Vec<Buffer>, // [MAX_SEQ * kv_dim] per layer
+    pub embd_off: u64,
+    pub embd_type: GGMLType,
+    pub output_off: u64,
+    pub output_type: GGMLType,
+    pub out_norm_off: u64,
+    // Scratch buffers (single-token, FP32)
+    pub x: Buffer,
+    pub norm_out: Buffer,
+    pub q: Buffer,
+    pub k: Buffer,
+    pub v: Buffer,
+    pub attn_out: Buffer,
+    pub gate: Buffer,
+    pub up: Buffer,
+    pub ffn_mid: Buffer,
+    pub logits: Buffer,
+    pub argmax_buf: Buffer,
+    // KV cache (single-token, FP32)
+    pub k_cache: Vec<Buffer>,
     pub v_cache: Vec<Buffer>,
 }
 
@@ -70,7 +75,7 @@ pub struct LayerOffsets {
     pub ffn_up: u64,
     pub ffn_down: u64,
     pub ffn_norm: u64,
-    // dtype info for dispatch
+    // dtype for single-token dispatch
     pub attn_q_type: GGMLType,
     pub attn_k_type: GGMLType,
     pub attn_v_type: GGMLType,
@@ -78,6 +83,22 @@ pub struct LayerOffsets {
     pub ffn_gate_type: GGMLType,
     pub ffn_up_type: GGMLType,
     pub ffn_down_type: GGMLType,
+    // FP16 offsets (into fp16_buf)
+    pub fp16_attn_q: u64,
+    pub fp16_attn_k: u64,
+    pub fp16_attn_v: u64,
+    pub fp16_attn_output: u64,
+    pub fp16_ffn_gate: u64,
+    pub fp16_ffn_up: u64,
+    pub fp16_ffn_down: u64,
+}
+
+struct DequantJob {
+    dtype: GGMLType,
+    quant_off: u64,
+    fp16_off: u64,
+    rows: u32,
+    cols: u32,
 }
 
 impl Model {
@@ -86,7 +107,7 @@ impl Model {
         let queue = device.new_command_queue();
         eprintln!("model: device={}, compiling shaders...", device.name());
 
-        // Compile all shaders
+        // Compile single-token shaders
         let src = kernels::all_kernels();
         let lib = device.new_library_with_source(&src)?;
         let p_rmsnorm = device.new_compute_pipeline(&lib.get_function("rmsnorm")?)?;
@@ -107,64 +128,134 @@ impl Model {
         let p_argmax = device.new_compute_pipeline(&lib.get_function("argmax")?)?;
         eprintln!("model: shaders compiled");
 
-        // Upload weight data to GPU
+        // Upload quantized weight data to GPU
         let td_start = gguf.tensor_data_start;
         let td_len = gguf.data.len() - td_start;
         let weights = device.new_buffer_with_data(
             gguf.data[td_start..].as_ptr() as *const c_void,
             td_len as u64,
         );
-        eprintln!("model: weights uploaded ({:.1}MB)", td_len as f64 / 1e6);
+        eprintln!("model: quantized weights uploaded ({:.1}MB)", td_len as f64 / 1e6);
 
         let cfg = &gguf.config;
-        // Derive real head_dim from tensor shapes
         let q_tensor = gguf.tensor("blk.0.attn_q.weight")
             .ok_or("missing blk.0.attn_q.weight")?;
         let head_dim = (q_tensor.dims[1] as u32) / cfg.n_heads;
         let q_dim = cfg.n_heads * head_dim;
         let kv_dim = cfg.n_kv_heads * head_dim;
         let gqa_ratio = cfg.n_heads / cfg.n_kv_heads;
+        let h = cfg.hidden_dim;
 
-        eprintln!("model: head_dim={head_dim}, q_dim={q_dim}, kv_dim={kv_dim}, gqa={gqa_ratio}");
-
-        // Collect per-layer offsets
+        // Collect per-layer offsets + compute FP16 layout
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
+        let mut jobs: Vec<DequantJob> = Vec::new();
+        let mut cursor: u64 = 0;
+
+        // Embedding FP16
+        let embd = gguf.tensor("token_embd.weight").ok_or("missing token_embd.weight")?;
+        let fp16_embd_off = cursor;
+        jobs.push(DequantJob { dtype: embd.dtype, quant_off: embd.offset,
+            fp16_off: cursor, rows: cfg.vocab_size, cols: h });
+        cursor += cfg.vocab_size as u64 * h as u64 * 2;
+
+        // Output FP16 (tied weights share embedding)
+        let out_norm = gguf.tensor("output_norm.weight").ok_or("missing output_norm.weight")?;
+        let (output_off, output_type) = if let Some(out) = gguf.tensor("output.weight") {
+            (out.offset, out.dtype)
+        } else {
+            eprintln!("model: output.weight not found, using tied embeddings");
+            (embd.offset, embd.dtype)
+        };
+        let fp16_output_off = if output_off == embd.offset {
+            fp16_embd_off // tied: share FP16 buffer
+        } else {
+            let off = cursor;
+            jobs.push(DequantJob { dtype: output_type, quant_off: output_off,
+                fp16_off: cursor, rows: cfg.vocab_size, cols: h });
+            cursor += cfg.vocab_size as u64 * h as u64 * 2;
+            off
+        };
+
+        // Per-layer weight tensors
         for i in 0..cfg.n_layers {
             let get = |name: &str| -> Result<(u64, GGMLType), String> {
                 let full = format!("blk.{i}.{name}");
                 let t = gguf.tensor(&full).ok_or(format!("missing {full}"))?;
                 Ok((t.offset, t.dtype))
             };
-            let (attn_q, attn_q_type) = get("attn_q.weight")?;
-            let (attn_k, attn_k_type) = get("attn_k.weight")?;
-            let (attn_v, attn_v_type) = get("attn_v.weight")?;
-            let (attn_output, attn_output_type) = get("attn_output.weight")?;
+            let (attn_q, aqt) = get("attn_q.weight")?;
+            let (attn_k, akt) = get("attn_k.weight")?;
+            let (attn_v, avt) = get("attn_v.weight")?;
+            let (attn_output, aot) = get("attn_output.weight")?;
             let (attn_norm, _) = get("attn_norm.weight")?;
-            let (ffn_gate, ffn_gate_type) = get("ffn_gate.weight")?;
-            let (ffn_up, ffn_up_type) = get("ffn_up.weight")?;
-            let (ffn_down, ffn_down_type) = get("ffn_down.weight")?;
+            let (ffn_gate, fgt) = get("ffn_gate.weight")?;
+            let (ffn_up, fut) = get("ffn_up.weight")?;
+            let (ffn_down, fdt) = get("ffn_down.weight")?;
             let (ffn_norm, _) = get("ffn_norm.weight")?;
+
+            // Allocate FP16 space for each weight tensor
+            macro_rules! alloc {
+                ($dt:expr, $qoff:expr, $r:expr, $c:expr) => {{
+                    let off = cursor;
+                    jobs.push(DequantJob { dtype: $dt, quant_off: $qoff,
+                        fp16_off: off, rows: $r, cols: $c });
+                    cursor += $r as u64 * $c as u64 * 2;
+                    off
+                }};
+            }
+
             layers.push(LayerOffsets {
                 attn_q, attn_k, attn_v, attn_output, attn_norm,
                 ffn_gate, ffn_up, ffn_down, ffn_norm,
-                attn_q_type, attn_k_type, attn_v_type, attn_output_type,
-                ffn_gate_type, ffn_up_type, ffn_down_type,
+                attn_q_type: aqt, attn_k_type: akt, attn_v_type: avt,
+                attn_output_type: aot,
+                ffn_gate_type: fgt, ffn_up_type: fut, ffn_down_type: fdt,
+                fp16_attn_q: alloc!(aqt, attn_q, q_dim, h),
+                fp16_attn_k: alloc!(akt, attn_k, kv_dim, h),
+                fp16_attn_v: alloc!(avt, attn_v, kv_dim, h),
+                fp16_attn_output: alloc!(aot, attn_output, h, q_dim),
+                fp16_ffn_gate: alloc!(fgt, ffn_gate, cfg.ffn_dim, h),
+                fp16_ffn_up: alloc!(fut, ffn_up, cfg.ffn_dim, h),
+                fp16_ffn_down: alloc!(fdt, ffn_down, h, cfg.ffn_dim),
             });
         }
 
-        let embd = gguf.tensor("token_embd.weight").ok_or("missing token_embd.weight")?;
-        let embd_type = embd.dtype;
-        let out_norm = gguf.tensor("output_norm.weight").ok_or("missing output_norm.weight")?;
-        // Tied weights fallback: many Llama models share token_embd as output projection
-        let (output_off, output_type) = if let Some(out) = gguf.tensor("output.weight") {
-            (out.offset, out.dtype)
-        } else {
-            eprintln!("model: output.weight not found, using tied embeddings (token_embd.weight)");
-            (embd.offset, embd.dtype)
-        };
-        eprintln!("model: embd_type={:?}, output_type={:?}", embd_type, output_type);
+        // Allocate FP16 buffer and run GPU dequant
+        let fp16_buf = device.new_buffer(cursor);
+        eprintln!("model: FP16 buffer allocated ({:.1}MB, {} tensors to dequant)",
+            cursor as f64 / 1e6, jobs.len());
 
-        // Scratch buffers
+        let dequant_src = kernels_fp16::dequant_source();
+        let dequant_lib = device.new_library_with_source(&dequant_src)?;
+        let pd_q4_0 = device.new_compute_pipeline(&dequant_lib.get_function("dequant_q4_0")?)?;
+        let pd_q4_1 = device.new_compute_pipeline(&dequant_lib.get_function("dequant_q4_1")?)?;
+        let pd_q6k = device.new_compute_pipeline(&dequant_lib.get_function("dequant_q6k")?)?;
+
+        let cmd = queue.new_command_buffer();
+        let enc = cmd.new_compute_encoder();
+        for job in &jobs {
+            let pipe = match job.dtype {
+                GGMLType::Q4_0 => &pd_q4_0,
+                GGMLType::Q4_1 => &pd_q4_1,
+                GGMLType::Q6K => &pd_q6k,
+                _ => return Err(format!("unsupported dequant dtype: {:?}", job.dtype)),
+            };
+            enc.set_pipeline(pipe);
+            enc.set_buffer(0, &weights, job.quant_off);
+            enc.set_buffer(1, &fp16_buf, job.fp16_off);
+            enc.set_bytes(2, &job.cols as *const u32 as *const c_void, 4);
+            enc.set_bytes(3, &job.rows as *const u32 as *const c_void, 4);
+            enc.dispatch_threads(
+                MTLSize::new(job.cols as u64, job.rows as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        eprintln!("model: FP16 dequant complete");
+
+        // Scratch buffers (single-token, FP32)
         let f = |n: u32| device.new_buffer(n as u64 * 4);
         let x = f(cfg.hidden_dim);
         let norm_out = f(cfg.hidden_dim);
@@ -176,9 +267,9 @@ impl Model {
         let up = f(cfg.ffn_dim);
         let ffn_mid = f(cfg.ffn_dim);
         let logits = f(cfg.vocab_size);
-        let argmax_buf = device.new_buffer(4); // single u32
+        let argmax_buf = device.new_buffer(4);
 
-        // KV cache
+        // KV cache (single-token, FP32)
         let kv_size = MAX_SEQ as u64 * kv_dim as u64 * 4;
         let mut k_cache = Vec::with_capacity(cfg.n_layers as usize);
         let mut v_cache = Vec::with_capacity(cfg.n_layers as usize);
@@ -186,8 +277,6 @@ impl Model {
             k_cache.push(device.new_buffer(kv_size));
             v_cache.push(device.new_buffer(kv_size));
         }
-        eprintln!("model: KV cache {:.1}MB ({MAX_SEQ} max seq)",
-            kv_size as f64 * 2.0 * cfg.n_layers as f64 / 1e6);
 
         Ok(Model {
             cfg: gguf.config.clone(), head_dim, gqa_ratio, kv_dim, q_dim,
@@ -196,8 +285,9 @@ impl Model {
             p_q4_0_add, p_q4_1_add, p_q4k_add, p_q6k_add,
             p_embed_q4_0, p_embed_q6k,
             p_rope, p_kv_store, p_attn, p_silu, p_argmax,
-            weights, layers,
-            embd_off: embd.offset, embd_type,
+            weights, fp16_buf, fp16_embd_off, fp16_output_off,
+            layers,
+            embd_off: embd.offset, embd_type: embd.dtype,
             output_off, output_type,
             out_norm_off: out_norm.offset,
             x, norm_out, q: q_buf, k: k_buf, v: v_buf, attn_out,
@@ -206,7 +296,6 @@ impl Model {
         })
     }
 
-    /// Get the pipeline for a given quantization type's matvec.
     pub fn matvec_pipeline(&self, dtype: GGMLType) -> &Pipeline {
         match dtype {
             GGMLType::Q4_0 => &self.p_q4_0,
@@ -217,7 +306,6 @@ impl Model {
         }
     }
 
-    /// Get the fused matvec+residual_add pipeline for a given quantization type.
     pub fn matvec_add_pipeline(&self, dtype: GGMLType) -> &Pipeline {
         match dtype {
             GGMLType::Q4_0 => &self.p_q4_0_add,

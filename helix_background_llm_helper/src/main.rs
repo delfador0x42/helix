@@ -16,6 +16,7 @@ mod infer;
 mod bench_dispatch;
 mod bench_kernels;
 mod kernels_batch;
+mod kernels_fp16;
 mod infer_batch;
 
 use std::path::{Path, PathBuf};

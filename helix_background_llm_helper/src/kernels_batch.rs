@@ -5,9 +5,10 @@
 //! Grid = (ceil(rows/8), 1), TG = 256 = 8 simdgroups.
 //! Iteration 10: unconditional FMA, conditional writes only.
 
-/// Default batch size for specialized kernels.
-/// FP16 sweet spot: N=50 (1,556 tok/s). N=64+ shows register spill.
-pub const BATCH_SIZE: u32 = 50;
+/// Default batch size: 80 = 10 MMA groups × 8.
+/// Compute ceiling at ~0.44ms/token (39% of M3 Max FP16 MMA peak).
+/// B=128 tested: same per-token time but worse attention cost.
+pub const BATCH_SIZE: u32 = 80;
 
 /// Padded batch size for MMA kernel (must be multiple of 8 for simdgroup_matrix).
 /// Buffers allocated with this size; element-wise kernels still dispatch with BATCH_SIZE.
@@ -384,11 +385,11 @@ pub fn gen_matmul_q4_0_f16_named(name: &str, n: u32) -> String {
 }
 
 /// Generate Q4_0 batch matmul v3b using simdgroup_matrix hardware MMA.
-/// Grid: (ceil(rows/32), 1), TG: 128 = 4 simdgroups.
-/// v3b: Per-simdgroup tile staging with simdgroup_barrier (not threadgroup_barrier).
+/// Grid: (ceil(rows/32), 1), TG: 128 = 4 simdgroups, 32 rows per TG.
+/// Per-simdgroup tile staging with simdgroup_barrier (not threadgroup_barrier).
 /// Each simdgroup independently stages its 8 rows × 32 K elements into a local tile,
-/// uses simdgroup_barrier (fast, local sync) instead of threadgroup_barrier (slow, global).
-/// Then iterates 4 K steps loading B from the tile, 7 A loads + MMAs per step.
+/// then iterates 4 K steps loading B from the tile, 7 A loads + MMAs per step.
+/// Note: 256-thread variant tested and was 5.4% slower (worse TG occupancy).
 pub fn gen_matmul_q4_0_mma() -> String {
     let mut s = String::with_capacity(8192);
     s += "kernel void matmul_q4_0_mma(\n";
@@ -412,19 +413,29 @@ pub fn gen_matmul_q4_0_mma() -> String {
     s += "    threadgroup half tiles[4 * 32 * 9];\n";
     s += "    threadgroup half *tile = tiles + sgid * 32 * 9;\n";
     s += "\n";
-    s += "    simdgroup_half8x8 C0(0.0h), C1(0.0h), C2(0.0h), C3(0.0h);\n";
-    s += "    simdgroup_half8x8 C4(0.0h), C5(0.0h), C6(0.0h);\n";
+    let n_groups = BATCH_SIZE / 8;
+    // Declare accumulators (4 per line for readability)
+    for g in 0..n_groups {
+        if g % 4 == 0 {
+            let end = std::cmp::min(g + 4, n_groups);
+            s += "    simdgroup_half8x8 ";
+            for i in g..end {
+                if i > g { s += ", "; }
+                s += &format!("C{i}(0.0h)");
+            }
+            s += ";\n";
+        }
+    }
     s += "\n";
     s += "    uint blocks_per_row = cols / 32;\n";
     s += "    uint row_bytes = blocks_per_row * 18;\n";
     s += "\n";
     s += "    for (uint bi = 0; bi < blocks_per_row; bi++) {\n";
     s += "\n";
-    // Stage: 32 threads fill 256 elements (32K × 8rows), 8 iterations each
-    // tile[k * 9 + r] = W[row_base + sgid*8 + r][bi*32 + k] (transposed)
+    // Stage: 32 threads per SG fill 256 elements (32K × 8rows)
     s += "        for (uint t = lane; t < 256; t += 32) {\n";
-    s += "            uint k = t >> 3;\n";        // K index 0-31 (t / 8)
-    s += "            uint r = t & 7;\n";          // row index 0-7 (t % 8)
+    s += "            uint k = t >> 3;\n";
+    s += "            uint r = t & 7;\n";
     s += "            uint global_row = row_base + sgid * 8 + r;\n";
     s += "            half w = 0.0h;\n";
     s += "            if (global_row < rows) {\n";
@@ -436,43 +447,25 @@ pub fn gen_matmul_q4_0_mma() -> String {
     s += "        }\n";
     s += "        simdgroup_barrier(mem_flags::mem_threadgroup);\n";
     s += "\n";
-    // 4 K steps: load B from tile, 7 A loads + MMAs
+    // 4 K steps: load B from tile, N A loads + MMAs
     s += "        for (uint ks = 0; ks < 4; ks++) {\n";
     s += "            simdgroup_half8x8 B;\n";
     s += "            simdgroup_load(B, tile + ks * 8 * 9, 9);\n";
     s += "\n";
-    s += "            { simdgroup_half8x8 A; simdgroup_load(A, X + 0u * cols + bi * 32 + ks * 8, cols); simdgroup_multiply_accumulate(C0, A, B, C0); }\n";
-    s += "            { simdgroup_half8x8 A; simdgroup_load(A, X + 8u * cols + bi * 32 + ks * 8, cols); simdgroup_multiply_accumulate(C1, A, B, C1); }\n";
-    s += "            { simdgroup_half8x8 A; simdgroup_load(A, X + 16u * cols + bi * 32 + ks * 8, cols); simdgroup_multiply_accumulate(C2, A, B, C2); }\n";
-    s += "            { simdgroup_half8x8 A; simdgroup_load(A, X + 24u * cols + bi * 32 + ks * 8, cols); simdgroup_multiply_accumulate(C3, A, B, C3); }\n";
-    s += "            { simdgroup_half8x8 A; simdgroup_load(A, X + 32u * cols + bi * 32 + ks * 8, cols); simdgroup_multiply_accumulate(C4, A, B, C4); }\n";
-    s += "            { simdgroup_half8x8 A; simdgroup_load(A, X + 40u * cols + bi * 32 + ks * 8, cols); simdgroup_multiply_accumulate(C5, A, B, C5); }\n";
-    s += "            { simdgroup_half8x8 A; simdgroup_load(A, X + 48u * cols + bi * 32 + ks * 8, cols); simdgroup_multiply_accumulate(C6, A, B, C6); }\n";
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("            {{ simdgroup_half8x8 A; simdgroup_load(A, X + {off}u * cols + bi * 32 + ks * 8, cols); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
+    }
     s += "        }\n";
     s += "\n";
     s += "        simdgroup_barrier(mem_flags::mem_threadgroup);\n";
     s += "    }\n";
     s += "\n";
-    // Store full batch groups directly to device memory
-    s += "    simdgroup_store(C0, Y + 0u * rows + row_base + sgid * 8, ulong(rows));\n";
-    s += "    simdgroup_store(C1, Y + 8u * rows + row_base + sgid * 8, ulong(rows));\n";
-    s += "    simdgroup_store(C2, Y + 16u * rows + row_base + sgid * 8, ulong(rows));\n";
-    s += "    simdgroup_store(C3, Y + 24u * rows + row_base + sgid * 8, ulong(rows));\n";
-    s += "    simdgroup_store(C4, Y + 32u * rows + row_base + sgid * 8, ulong(rows));\n";
-    s += "    simdgroup_store(C5, Y + 40u * rows + row_base + sgid * 8, ulong(rows));\n";
-    // Partial batch group 6: threadgroup staging for boundary handling
-    s += "    { threadgroup half tg[32 * 33];\n";
-    s += "        simdgroup_store(C6, tg + sgid * 8, 33);\n";
-    s += "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
-    s += "        for (uint t = lid; t < 256; t += 128) {\n";
-    s += "            uint b = t >> 5;\n";
-    s += "            uint r = t & 31;\n";
-    s += "            uint gbi = 48u + b;\n";
-    s += "            uint grow = row_base + r;\n";
-    s += "            if (gbi < batch && grow < rows)\n";
-    s += "                Y[gbi * rows + grow] = tg[b * 33 + r];\n";
-    s += "        }\n";
-    s += "    }\n";
+    // Store all batch groups directly
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("    simdgroup_store(C{g}, Y + {off}u * rows + row_base + sgid * 8, ulong(rows));\n");
+    }
     s += "}\n\n";
     s
 }
@@ -566,6 +559,50 @@ kernel void rmsnorm_batch(
     float rms = rsqrt(parts[0] / float(dim) + eps);
     for (uint i = lid; i < dim; i += tgs)
         yi[i] = half(float(xi[i]) * rms * float(weight[i]));
+}
+"#;
+
+/// Fused residual add + RMSNorm: res += add; norm = rmsnorm(res) * weight.
+/// Eliminates one read of res vs separate residual_add + rmsnorm.
+/// One threadgroup per batch item. TG = 256.
+const RESIDUAL_RMSNORM_BATCH: &str = r#"
+kernel void residual_rmsnorm_batch(
+    device half        *res    [[buffer(0)]],
+    device const half  *add    [[buffer(1)]],
+    device half        *norm   [[buffer(2)]],
+    device const float *weight [[buffer(3)]],
+    constant uint      &dim    [[buffer(4)]],
+    constant float     &eps    [[buffer(5)]],
+    constant uint      &batch  [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tgs  [[threads_per_threadgroup]]
+) {
+    if (tgid >= batch) return;
+    device half *ri = res + tgid * dim;
+    device const half *ai = add + tgid * dim;
+    device half *ni = norm + tgid * dim;
+    // Pass 1: residual add + accumulate sum of squares
+    float sum_sq = 0.0;
+    for (uint i = lid; i < dim; i += tgs) {
+        float v = float(ri[i]) + float(ai[i]);
+        ri[i] = half(v);
+        sum_sq += v * v;
+    }
+    sum_sq = simd_sum(sum_sq);
+    threadgroup float parts[32];
+    if (lid % 32 == 0) parts[lid / 32] = sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 32) {
+        float v = (lid < (tgs + 31) / 32) ? parts[lid] : 0.0;
+        v = simd_sum(v);
+        if (lid == 0) parts[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rms = rsqrt(parts[0] / float(dim) + eps);
+    // Pass 2: normalize (re-read updated res)
+    for (uint i = lid; i < dim; i += tgs)
+        ni[i] = half(float(ri[i]) * rms * float(weight[i]));
 }
 "#;
 
@@ -762,23 +799,20 @@ kernel void argmax_batch(
 
 pub fn all_batch_kernels() -> String {
     let mut s = HEADER.to_string();
-    // Batch matmul kernels (generated, N-parameterized)
-    s += &gen_matmul_q4_0(BATCH_SIZE);
-    s += &gen_matmul_q4_0_add(BATCH_SIZE);
-    s += &gen_matmul_q6k(BATCH_SIZE);
+    // Q4_0 MMA v3b: quantized dequant + simdgroup staging (bandwidth-optimal)
+    s += &gen_matmul_q4_0_mma();
+    // FP16 scalar matmul (fallback for Q4_1/Q6K when MMA not available)
     s += &gen_matmul_q4_0_f16(BATCH_SIZE);
     s += &gen_matmul_q4_1_f16(BATCH_SIZE);
     s += &gen_matmul_q6k_f16(BATCH_SIZE);
-    // MMA (simdgroup_matrix) kernel for Q4_0
-    s += &gen_matmul_q4_0_mma();
-    // Variant N values for benchmarking register pressure vs throughput
-    for &n in &[32u32, 50, 64, 100] {
-        s += &gen_matmul_q4_0_f16_named(&format!("matmul_q4_0_f16_n{n}"), n);
-    }
-    // Batch element-wise kernels (static MSL)
+    // Pure FP16 MMA matmul (for Q4_1/Q6K via pre-dequant, 256-thread TG)
+    s += &crate::kernels_fp16::gen_matmul_fp16_mma();
+    // Batch element-wise kernels
+    s += crate::kernels_fp16::EMBED_FP16;
     s += EMBED_BATCH_Q4_0;
     s += EMBED_BATCH_Q6K;
     s += RMSNORM_BATCH;
+    s += RESIDUAL_RMSNORM_BATCH;
     s += ROPE_BATCH;
     s += KV_STORE_BATCH;
     s += SILU_MUL_BATCH;
