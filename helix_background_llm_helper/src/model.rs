@@ -1,6 +1,6 @@
 //! Loads GGUF weights into GPU buffers and compiles Metal pipelines.
-//! Llama architecture only (Q4_0/Q4_1/Q4_K/Q6_K quantization types).
-//! Pre-dequantizes all weight tensors to FP16 at load time for MMA matmul.
+//! Llama architecture only (Q4_0/Q4_1/Q4_K/Q5_K/Q6_K quantization types).
+//! FP16 pre-dequant is optional — skipped for large models (70B+).
 
 use crate::gpu::*;
 use crate::gguf::{GGUFFile, GGMLType, ModelConfig};
@@ -23,13 +23,19 @@ pub struct Model {
     pub p_q4_0: Pipeline,
     pub p_q4_1: Pipeline,
     pub p_q4k: Pipeline,
+    pub p_q5k: Pipeline,
     pub p_q6k: Pipeline,
+    pub p_q8_0: Pipeline,
     pub p_q4_0_add: Pipeline,
     pub p_q4_1_add: Pipeline,
     pub p_q4k_add: Pipeline,
+    pub p_q5k_add: Pipeline,
     pub p_q6k_add: Pipeline,
+    pub p_q8_0_add: Pipeline,
     pub p_embed_q4_0: Pipeline,
+    pub p_embed_q5k: Pipeline,
     pub p_embed_q6k: Pipeline,
+    pub p_embed_q8_0: Pipeline,
     pub p_rope: Pipeline,
     pub p_kv_store: Pipeline,
     pub p_attn: Pipeline,
@@ -114,13 +120,19 @@ impl Model {
         let p_q4_0 = device.new_compute_pipeline(&lib.get_function("matvec_q4_0")?)?;
         let p_q4_1 = device.new_compute_pipeline(&lib.get_function("matvec_q4_1")?)?;
         let p_q4k = device.new_compute_pipeline(&lib.get_function("matvec_q4k")?)?;
+        let p_q5k = device.new_compute_pipeline(&lib.get_function("matvec_q5k")?)?;
         let p_q6k = device.new_compute_pipeline(&lib.get_function("matvec_q6k")?)?;
+        let p_q8_0 = device.new_compute_pipeline(&lib.get_function("matvec_q8_0")?)?;
         let p_q4_0_add = device.new_compute_pipeline(&lib.get_function("matvec_q4_0_add")?)?;
         let p_q4_1_add = device.new_compute_pipeline(&lib.get_function("matvec_q4_1_add")?)?;
         let p_q4k_add = device.new_compute_pipeline(&lib.get_function("matvec_q4k_add")?)?;
+        let p_q5k_add = device.new_compute_pipeline(&lib.get_function("matvec_q5k_add")?)?;
         let p_q6k_add = device.new_compute_pipeline(&lib.get_function("matvec_q6k_add")?)?;
+        let p_q8_0_add = device.new_compute_pipeline(&lib.get_function("matvec_q8_0_add")?)?;
         let p_embed_q4_0 = device.new_compute_pipeline(&lib.get_function("embed_q4_0")?)?;
+        let p_embed_q5k = device.new_compute_pipeline(&lib.get_function("embed_q5k")?)?;
         let p_embed_q6k = device.new_compute_pipeline(&lib.get_function("embed_q6k")?)?;
+        let p_embed_q8_0 = device.new_compute_pipeline(&lib.get_function("embed_q8_0")?)?;
         let p_rope = device.new_compute_pipeline(&lib.get_function("rope")?)?;
         let p_kv_store = device.new_compute_pipeline(&lib.get_function("kv_store")?)?;
         let p_attn = device.new_compute_pipeline(&lib.get_function("attention")?)?;
@@ -128,14 +140,32 @@ impl Model {
         let p_argmax = device.new_compute_pipeline(&lib.get_function("argmax")?)?;
         eprintln!("model: shaders compiled");
 
-        // Upload quantized weight data to GPU
-        let td_start = gguf.tensor_data_start;
-        let td_len = gguf.data.len() - td_start;
-        let weights = device.new_buffer_with_data(
-            gguf.data[td_start..].as_ptr() as *const c_void,
-            td_len as u64,
-        );
-        eprintln!("model: quantized weights uploaded ({:.1}MB)", td_len as f64 / 1e6);
+        // Upload quantized weight data to GPU (supports split GGUF)
+        let weights = if gguf.is_split() {
+            let total = gguf.total_tensor_bytes;
+            let buf = device.new_buffer(total);
+            let dst = buf.contents() as *mut u8;
+            for shard in &gguf.shards {
+                let src = &shard.data[shard.tensor_data_start..];
+                let len = shard.tensor_data_len;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst.add(shard.base_offset as usize), len);
+                }
+                eprintln!("model: shard copied {:.1}GB at offset {:.1}GB",
+                    len as f64 / 1e9, shard.base_offset as f64 / 1e9);
+            }
+            eprintln!("model: split weights uploaded ({:.1}GB total)", total as f64 / 1e9);
+            buf
+        } else {
+            let td_start = gguf.tensor_data_start;
+            let td_len = gguf.data.len() - td_start;
+            let buf = device.new_buffer_with_data(
+                gguf.data[td_start..].as_ptr() as *const c_void,
+                td_len as u64,
+            );
+            eprintln!("model: quantized weights uploaded ({:.1}MB)", td_len as f64 / 1e6);
+            buf
+        };
 
         let cfg = &gguf.config;
         let q_tensor = gguf.tensor("blk.0.attn_q.weight")
@@ -146,19 +176,10 @@ impl Model {
         let gqa_ratio = cfg.n_heads / cfg.n_kv_heads;
         let h = cfg.hidden_dim;
 
-        // Collect per-layer offsets + compute FP16 layout
+        // Collect per-layer offsets
         let mut layers = Vec::with_capacity(cfg.n_layers as usize);
-        let mut jobs: Vec<DequantJob> = Vec::new();
-        let mut cursor: u64 = 0;
 
-        // Embedding FP16
         let embd = gguf.tensor("token_embd.weight").ok_or("missing token_embd.weight")?;
-        let fp16_embd_off = cursor;
-        jobs.push(DequantJob { dtype: embd.dtype, quant_off: embd.offset,
-            fp16_off: cursor, rows: cfg.vocab_size, cols: h });
-        cursor += cfg.vocab_size as u64 * h as u64 * 2;
-
-        // Output FP16 (tied weights share embedding)
         let out_norm = gguf.tensor("output_norm.weight").ok_or("missing output_norm.weight")?;
         let (output_off, output_type) = if let Some(out) = gguf.tensor("output.weight") {
             (out.offset, out.dtype)
@@ -166,15 +187,40 @@ impl Model {
             eprintln!("model: output.weight not found, using tied embeddings");
             (embd.offset, embd.dtype)
         };
-        let fp16_output_off = if output_off == embd.offset {
-            fp16_embd_off // tied: share FP16 buffer
-        } else {
-            let off = cursor;
-            jobs.push(DequantJob { dtype: output_type, quant_off: output_off,
+
+        // Decide whether to do FP16 pre-dequant (skip for large models / Q5K)
+        let has_q5k = gguf.tensors.iter().any(|t| t.dtype == GGMLType::Q5K);
+        let fp16_budget = cfg.n_layers as u64 * 7 * (cfg.hidden_dim as u64).max(cfg.ffn_dim as u64)
+            * cfg.hidden_dim as u64 * 2;
+        let skip_fp16 = has_q5k || fp16_budget > 20_000_000_000; // >20GB = skip
+        if skip_fp16 {
+            eprintln!("model: skipping FP16 pre-dequant (Q5K or large model)");
+        }
+
+        let mut jobs: Vec<DequantJob> = Vec::new();
+        let mut cursor: u64 = 0;
+
+        // FP16 layout (only computed if !skip_fp16)
+        let fp16_embd_off;
+        let fp16_output_off;
+        if !skip_fp16 {
+            fp16_embd_off = cursor;
+            jobs.push(DequantJob { dtype: embd.dtype, quant_off: embd.offset,
                 fp16_off: cursor, rows: cfg.vocab_size, cols: h });
             cursor += cfg.vocab_size as u64 * h as u64 * 2;
-            off
-        };
+            fp16_output_off = if output_off == embd.offset {
+                fp16_embd_off
+            } else {
+                let off = cursor;
+                jobs.push(DequantJob { dtype: output_type, quant_off: output_off,
+                    fp16_off: cursor, rows: cfg.vocab_size, cols: h });
+                cursor += cfg.vocab_size as u64 * h as u64 * 2;
+                off
+            };
+        } else {
+            fp16_embd_off = 0;
+            fp16_output_off = 0;
+        }
 
         // Per-layer weight tensors
         for i in 0..cfg.n_layers {
@@ -193,15 +239,27 @@ impl Model {
             let (ffn_down, fdt) = get("ffn_down.weight")?;
             let (ffn_norm, _) = get("ffn_norm.weight")?;
 
-            // Allocate FP16 space for each weight tensor
-            macro_rules! alloc {
-                ($dt:expr, $qoff:expr, $r:expr, $c:expr) => {{
-                    let off = cursor;
-                    jobs.push(DequantJob { dtype: $dt, quant_off: $qoff,
-                        fp16_off: off, rows: $r, cols: $c });
-                    cursor += $r as u64 * $c as u64 * 2;
-                    off
-                }};
+            let (fp16_aq, fp16_ak, fp16_av, fp16_ao, fp16_fg, fp16_fu, fp16_fd);
+            if !skip_fp16 {
+                macro_rules! alloc {
+                    ($dt:expr, $qoff:expr, $r:expr, $c:expr) => {{
+                        let off = cursor;
+                        jobs.push(DequantJob { dtype: $dt, quant_off: $qoff,
+                            fp16_off: off, rows: $r, cols: $c });
+                        cursor += $r as u64 * $c as u64 * 2;
+                        off
+                    }};
+                }
+                fp16_aq = alloc!(aqt, attn_q, q_dim, h);
+                fp16_ak = alloc!(akt, attn_k, kv_dim, h);
+                fp16_av = alloc!(avt, attn_v, kv_dim, h);
+                fp16_ao = alloc!(aot, attn_output, h, q_dim);
+                fp16_fg = alloc!(fgt, ffn_gate, cfg.ffn_dim, h);
+                fp16_fu = alloc!(fut, ffn_up, cfg.ffn_dim, h);
+                fp16_fd = alloc!(fdt, ffn_down, h, cfg.ffn_dim);
+            } else {
+                fp16_aq = 0; fp16_ak = 0; fp16_av = 0; fp16_ao = 0;
+                fp16_fg = 0; fp16_fu = 0; fp16_fd = 0;
             }
 
             layers.push(LayerOffsets {
@@ -210,50 +268,53 @@ impl Model {
                 attn_q_type: aqt, attn_k_type: akt, attn_v_type: avt,
                 attn_output_type: aot,
                 ffn_gate_type: fgt, ffn_up_type: fut, ffn_down_type: fdt,
-                fp16_attn_q: alloc!(aqt, attn_q, q_dim, h),
-                fp16_attn_k: alloc!(akt, attn_k, kv_dim, h),
-                fp16_attn_v: alloc!(avt, attn_v, kv_dim, h),
-                fp16_attn_output: alloc!(aot, attn_output, h, q_dim),
-                fp16_ffn_gate: alloc!(fgt, ffn_gate, cfg.ffn_dim, h),
-                fp16_ffn_up: alloc!(fut, ffn_up, cfg.ffn_dim, h),
-                fp16_ffn_down: alloc!(fdt, ffn_down, h, cfg.ffn_dim),
+                fp16_attn_q: fp16_aq, fp16_attn_k: fp16_ak,
+                fp16_attn_v: fp16_av, fp16_attn_output: fp16_ao,
+                fp16_ffn_gate: fp16_fg, fp16_ffn_up: fp16_fu,
+                fp16_ffn_down: fp16_fd,
             });
         }
 
-        // Allocate FP16 buffer and run GPU dequant
-        let fp16_buf = device.new_buffer(cursor);
-        eprintln!("model: FP16 buffer allocated ({:.1}MB, {} tensors to dequant)",
-            cursor as f64 / 1e6, jobs.len());
+        // Allocate FP16 buffer and run GPU dequant (if not skipped)
+        let fp16_buf = if cursor > 0 {
+            let buf = device.new_buffer(cursor);
+            eprintln!("model: FP16 buffer allocated ({:.1}MB, {} tensors to dequant)",
+                cursor as f64 / 1e6, jobs.len());
 
-        let dequant_src = kernels_fp16::dequant_source();
-        let dequant_lib = device.new_library_with_source(&dequant_src)?;
-        let pd_q4_0 = device.new_compute_pipeline(&dequant_lib.get_function("dequant_q4_0")?)?;
-        let pd_q4_1 = device.new_compute_pipeline(&dequant_lib.get_function("dequant_q4_1")?)?;
-        let pd_q6k = device.new_compute_pipeline(&dequant_lib.get_function("dequant_q6k")?)?;
+            let dequant_src = kernels_fp16::dequant_source();
+            let dequant_lib = device.new_library_with_source(&dequant_src)?;
+            let pd_q4_0 = device.new_compute_pipeline(&dequant_lib.get_function("dequant_q4_0")?)?;
+            let pd_q4_1 = device.new_compute_pipeline(&dequant_lib.get_function("dequant_q4_1")?)?;
+            let pd_q6k = device.new_compute_pipeline(&dequant_lib.get_function("dequant_q6k")?)?;
 
-        let cmd = queue.new_command_buffer();
-        let enc = cmd.new_compute_encoder();
-        for job in &jobs {
-            let pipe = match job.dtype {
-                GGMLType::Q4_0 => &pd_q4_0,
-                GGMLType::Q4_1 => &pd_q4_1,
-                GGMLType::Q6K => &pd_q6k,
-                _ => return Err(format!("unsupported dequant dtype: {:?}", job.dtype)),
-            };
-            enc.set_pipeline(pipe);
-            enc.set_buffer(0, &weights, job.quant_off);
-            enc.set_buffer(1, &fp16_buf, job.fp16_off);
-            enc.set_bytes(2, &job.cols as *const u32 as *const c_void, 4);
-            enc.set_bytes(3, &job.rows as *const u32 as *const c_void, 4);
-            enc.dispatch_threads(
-                MTLSize::new(job.cols as u64, job.rows as u64, 1),
-                MTLSize::new(256, 1, 1),
-            );
-        }
-        enc.end_encoding();
-        cmd.commit();
-        cmd.wait_until_completed();
-        eprintln!("model: FP16 dequant complete");
+            let cmd = queue.new_command_buffer();
+            let enc = cmd.new_compute_encoder();
+            for job in &jobs {
+                let pipe = match job.dtype {
+                    GGMLType::Q4_0 => &pd_q4_0,
+                    GGMLType::Q4_1 => &pd_q4_1,
+                    GGMLType::Q6K => &pd_q6k,
+                    _ => return Err(format!("unsupported dequant dtype: {:?}", job.dtype)),
+                };
+                enc.set_pipeline(pipe);
+                enc.set_buffer(0, &weights, job.quant_off);
+                enc.set_buffer(1, &buf, job.fp16_off);
+                enc.set_bytes(2, &job.cols as *const u32 as *const c_void, 4);
+                enc.set_bytes(3, &job.rows as *const u32 as *const c_void, 4);
+                enc.dispatch_threads(
+                    MTLSize::new(job.cols as u64, job.rows as u64, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            }
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            eprintln!("model: FP16 dequant complete");
+            buf
+        } else {
+            eprintln!("model: no FP16 buffer needed (single-token only)");
+            device.new_buffer(4) // dummy 4-byte buffer
+        };
 
         // Scratch buffers (single-token, FP32)
         let f = |n: u32| device.new_buffer(n as u64 * 4);
@@ -281,9 +342,9 @@ impl Model {
         Ok(Model {
             cfg: gguf.config.clone(), head_dim, gqa_ratio, kv_dim, q_dim,
             device, queue,
-            p_rmsnorm, p_q4_0, p_q4_1, p_q4k, p_q6k,
-            p_q4_0_add, p_q4_1_add, p_q4k_add, p_q6k_add,
-            p_embed_q4_0, p_embed_q6k,
+            p_rmsnorm, p_q4_0, p_q4_1, p_q4k, p_q5k, p_q6k, p_q8_0,
+            p_q4_0_add, p_q4_1_add, p_q4k_add, p_q5k_add, p_q6k_add, p_q8_0_add,
+            p_embed_q4_0, p_embed_q5k, p_embed_q6k, p_embed_q8_0,
             p_rope, p_kv_store, p_attn, p_silu, p_argmax,
             weights, fp16_buf, fp16_embd_off, fp16_output_off,
             layers,
@@ -301,7 +362,9 @@ impl Model {
             GGMLType::Q4_0 => &self.p_q4_0,
             GGMLType::Q4_1 => &self.p_q4_1,
             GGMLType::Q4K => &self.p_q4k,
+            GGMLType::Q5K => &self.p_q5k,
             GGMLType::Q6K => &self.p_q6k,
+            GGMLType::Q8_0 => &self.p_q8_0,
             _ => panic!("unsupported matvec dtype: {:?}", dtype),
         }
     }
@@ -311,7 +374,9 @@ impl Model {
             GGMLType::Q4_0 => &self.p_q4_0_add,
             GGMLType::Q4_1 => &self.p_q4_1_add,
             GGMLType::Q4K => &self.p_q4k_add,
+            GGMLType::Q5K => &self.p_q5k_add,
             GGMLType::Q6K => &self.p_q6k_add,
+            GGMLType::Q8_0 => &self.p_q8_0_add,
             _ => panic!("unsupported matvec_add dtype: {:?}", dtype),
         }
     }
@@ -319,7 +384,9 @@ impl Model {
     pub fn embed_pipeline(&self, dtype: GGMLType) -> &Pipeline {
         match dtype {
             GGMLType::Q4_0 => &self.p_embed_q4_0,
+            GGMLType::Q5K => &self.p_embed_q5k,
             GGMLType::Q6K => &self.p_embed_q6k,
+            GGMLType::Q8_0 => &self.p_embed_q8_0,
             _ => panic!("unsupported embed dtype: {:?}", dtype),
         }
     }

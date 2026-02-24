@@ -30,13 +30,21 @@ pub struct BatchState {
     pub p_matmul_q4_0_f16: Pipeline,   // Scalar B=80
     pub p_matmul_q4_1_f16: Pipeline,
     pub p_matmul_q6k_f16: Pipeline,
+    // Grid-tiled quantized MMA: Q5K/Q6K/Q8_0 (amortized dequant, for 70B+)
+    pub p_q5k_grid: Pipeline,
+    pub p_q6k_grid: Pipeline,
+    pub p_q8_0_grid: Pipeline,
     // n=1 scalar matvec: single-token decode through batch path
     pub p_matvec_q4_0: Pipeline,
     pub p_matvec_q4_1: Pipeline,
     pub p_matvec_q6k: Pipeline,
+    pub p_matvec_q5k: Pipeline,
+    pub p_matvec_q8_0: Pipeline,
     pub p_embed_fp16: Pipeline,
     pub p_embed_q4_0: Pipeline,
     pub p_embed_q6k: Pipeline,
+    pub p_embed_q5k: Pipeline,
+    pub p_embed_q8_0: Pipeline,
     pub p_rmsnorm: Pipeline,
     pub p_residual_rmsnorm: Pipeline,
     pub p_rope: Pipeline,
@@ -80,6 +88,9 @@ impl BatchState {
 
         let p_q4_0_grid = pipe("matmul_q4_0_mma_grid")?;
         let p_fp16_grid = pipe("matmul_fp16_mma_grid")?;
+        let p_q5k_grid = pipe("matmul_q5k_grid")?;
+        let p_q6k_grid = pipe("matmul_q6k_grid")?;
+        let p_q8_0_grid = pipe("matmul_q8_0_grid")?;
         let p_q4_0_mma = pipe("matmul_q4_0_mma")?;
         let p_fp16_mma = pipe("matmul_fp16_mma")?;
         let p_fp16_mma_128 = pipe("matmul_fp16_mma_128")?;
@@ -89,9 +100,13 @@ impl BatchState {
         let p_matvec_q4_0 = pipe("matvec_q4_0_f16")?;
         let p_matvec_q4_1 = pipe("matvec_q4_1_f16")?;
         let p_matvec_q6k = pipe("matvec_q6k_f16")?;
+        let p_matvec_q5k = pipe("matvec_q5k_f16")?;
+        let p_matvec_q8_0 = pipe("matvec_q8_0_f16")?;
         let p_embed_fp16 = pipe("embed_fp16")?;
         let p_embed_q4_0 = pipe("embed_batch_q4_0")?;
         let p_embed_q6k = pipe("embed_batch_q6k")?;
+        let p_embed_q5k = pipe("embed_batch_q5k")?;
+        let p_embed_q8_0 = pipe("embed_batch_q8_0")?;
         let p_rmsnorm = pipe("rmsnorm_batch")?;
         let p_residual_rmsnorm = pipe("residual_rmsnorm_batch")?;
         let p_rope = pipe("rope_batch")?;
@@ -138,11 +153,14 @@ impl BatchState {
         Ok(BatchState {
             batch_size: bs,
             p_q4_0_grid, p_fp16_grid,
+            p_q5k_grid, p_q6k_grid, p_q8_0_grid,
             p_q4_0_mma, p_fp16_mma, p_fp16_mma_128,
             p_matmul_q4_0_f16, p_matmul_q4_1_f16, p_matmul_q6k_f16,
             p_matvec_q4_0, p_matvec_q4_1, p_matvec_q6k,
+            p_matvec_q5k, p_matvec_q8_0,
             p_residual_rmsnorm,
             p_embed_fp16, p_embed_q4_0, p_embed_q6k,
+            p_embed_q5k, p_embed_q8_0,
             p_rmsnorm, p_rope, p_kv_store, p_silu_mul,
             p_residual_add, p_attn_causal, p_argmax,
             tokens_buf, x, norm_out, q, k, v, attn_out,
@@ -178,8 +196,8 @@ pub fn forward_batch_n(
     let cmd = model.queue.new_command_buffer();
     let enc = cmd.new_compute_encoder();
 
-    // ── Embedding: FP16 weights → x[n × hidden_dim] ──
-    dispatch_embed_fp16(&enc, model, batch, b);
+    // ── Embedding: dtype-aware → x[n × hidden_dim] ──
+    dispatch_embed(&enc, model, batch, b);
 
     // ── Transformer layers ──
     for layer in 0..cfg.n_layers as usize {
@@ -355,7 +373,7 @@ pub fn forward_profiled(
 
     // Embedding
     timed!(elem_us, |enc: &ComputeEncoder| {
-        dispatch_embed_fp16(enc, model, batch, b);
+        dispatch_embed(enc, model, batch, b);
     });
 
     for layer in 0..cfg.n_layers as usize {
@@ -459,10 +477,19 @@ pub fn forward_profiled(
 
 // ── Dispatch helpers ──
 
-fn dispatch_embed_fp16(enc: &ComputeEncoder, model: &Model, batch: &BatchState, bs: u32) {
+/// Dtype-aware embedding dispatch: routes to FP16/Q4_0/Q5K/Q6K/Q8_0 kernel.
+fn dispatch_embed(enc: &ComputeEncoder, model: &Model, batch: &BatchState, bs: u32) {
     let dim = model.cfg.hidden_dim;
-    enc.set_pipeline(&batch.p_embed_fp16);
-    enc.set_buffer(0, &model.fp16_buf, model.fp16_embd_off);
+    let dtype = model.embd_type;
+    let (pipe, buf, off) = match dtype {
+        GGMLType::Q4_0 => (&batch.p_embed_q4_0, &model.weights, model.embd_off),
+        GGMLType::Q5K  => (&batch.p_embed_q5k, &model.weights, model.embd_off),
+        GGMLType::Q6K  => (&batch.p_embed_q6k, &model.weights, model.embd_off),
+        GGMLType::Q8_0 => (&batch.p_embed_q8_0, &model.weights, model.embd_off),
+        _ => (&batch.p_embed_fp16, &model.fp16_buf, model.fp16_embd_off),
+    };
+    enc.set_pipeline(pipe);
+    enc.set_buffer(0, buf, off);
     enc.set_buffer(1, &batch.x, 0);
     enc.set_buffer(2, &batch.tokens_buf, 0);
     enc.set_bytes(3, &dim as *const u32 as *const c_void, 4);
@@ -505,6 +532,9 @@ fn dispatch_matmul(
     } else {
         match dtype {
             GGMLType::Q4_0 => dispatch_q4_0_grid(enc, model, batch, quant_off, x, y, cols, rows, b),
+            GGMLType::Q5K  => dispatch_quant_grid(enc, model, batch, &batch.p_q5k_grid, quant_off, x, y, cols, rows, b),
+            GGMLType::Q6K  => dispatch_quant_grid(enc, model, batch, &batch.p_q6k_grid, quant_off, x, y, cols, rows, b),
+            GGMLType::Q8_0 => dispatch_quant_grid(enc, model, batch, &batch.p_q8_0_grid, quant_off, x, y, cols, rows, b),
             _ => dispatch_fp16_grid(enc, model, batch, fp16_off, x, y, cols, rows, b),
         }
     }
@@ -521,7 +551,9 @@ fn dispatch_scalar_matvec(
     let pipe = match dtype {
         GGMLType::Q4_0 => &batch.p_matvec_q4_0,
         GGMLType::Q4_1 => &batch.p_matvec_q4_1,
-        GGMLType::Q6K => &batch.p_matvec_q6k,
+        GGMLType::Q5K  => &batch.p_matvec_q5k,
+        GGMLType::Q6K  => &batch.p_matvec_q6k,
+        GGMLType::Q8_0 => &batch.p_matvec_q8_0,
         _ => panic!("unsupported scalar matvec dtype: {:?}", dtype),
     };
     enc.set_pipeline(pipe);
@@ -552,6 +584,29 @@ fn dispatch_q4_0_grid(
     enc.set_bytes(4, &rows as *const u32 as *const c_void, 4);
     enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
     let row_groups = ((rows + 31) / 32) as u64;
+    let batch_tiles = ((b as u64 + TILE_B as u64 - 1) / TILE_B as u64) as u64;
+    enc.dispatch_threadgroups(
+        MTLSize::new(row_groups, batch_tiles, 1),
+        MTLSize::new(128, 1, 1),
+    );
+}
+
+/// Grid-tiled quantized MMA: Q5K/Q6K/Q8_0 with staging + simdgroup MMA.
+/// tile_b=80, 4 SG = 128 threads, 32 rows per TG (same as Q4_0 v3b).
+/// Grid: (ceil(rows/32), ceil(b/80)), TG: 128.
+fn dispatch_quant_grid(
+    enc: &ComputeEncoder, model: &Model, _batch: &BatchState,
+    pipe: &Pipeline, quant_off: u64,
+    x: &Buffer, y: &Buffer, cols: u32, rows: u32, b: u32,
+) {
+    enc.set_pipeline(pipe);
+    enc.set_buffer(0, &model.weights, quant_off);
+    enc.set_buffer(1, x, 0);
+    enc.set_buffer(2, y, 0);
+    enc.set_bytes(3, &cols as *const u32 as *const c_void, 4);
+    enc.set_bytes(4, &rows as *const u32 as *const c_void, 4);
+    enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+    let row_groups = ((rows + 31) / 32) as u64;   // 32 rows per TG (4 SGs × 8 rows)
     let batch_tiles = ((b as u64 + TILE_B as u64 - 1) / TILE_B as u64) as u64;
     enc.dispatch_threadgroups(
         MTLSize::new(row_groups, batch_tiles, 1),

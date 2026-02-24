@@ -136,7 +136,9 @@ pub struct TensorInfo {
     pub name: String,
     pub dims: Vec<u64>,       // dimensions (innermost first in GGML convention)
     pub dtype: GGMLType,
-    pub offset: u64,          // relative to tensor data section start
+    pub offset: u64,          // relative to combined tensor data (global offset for GPU)
+    pub shard: usize,         // which shard this tensor lives in
+    pub shard_offset: u64,    // original offset within shard's tensor data section
 }
 
 impl TensorInfo {
@@ -172,14 +174,25 @@ pub struct ModelConfig {
 
 // ── GGUF file (parsed, mmap'd) ─────────────────────────────────────
 
+/// Per-shard info for split GGUF. Single-file GGUF has one shard.
+pub struct ShardInfo {
+    pub data: &'static [u8],         // mmap'd view
+    pub tensor_data_start: usize,    // absolute file offset where tensor data begins
+    pub tensor_data_len: usize,      // bytes of tensor data in this shard
+    pub base_offset: u64,            // offset of this shard's data in combined GPU buffer
+}
+
 pub struct GGUFFile {
-    _mmap: Mmap,                          // owns the mapping
-    pub data: &'static [u8],             // view into mmap (lifetime tied to struct)
+    _mmaps: Vec<Mmap>,                    // owns all shard mappings
+    pub shards: Vec<ShardInfo>,           // per-shard data slices
     pub metadata: HashMap<String, MetaValue>,
     pub tensors: Vec<TensorInfo>,
-    pub tensor_data_start: usize,        // absolute file offset where tensor data begins
+    pub total_tensor_bytes: u64,          // sum of all shards' tensor data
     pub alignment: usize,
     pub config: ModelConfig,
+    // Backwards compat for single-shard (first shard)
+    pub data: &'static [u8],
+    pub tensor_data_start: usize,
 }
 
 // ── mmap wrapper ────────────────────────────────────────────────────
@@ -323,87 +336,120 @@ impl<'a> Cursor<'a> {
 
 impl GGUFFile {
     pub fn open(path: &Path) -> Result<Self, String> {
+        // Detect split GGUF: path is a directory, or matches *-00001-of-*.gguf
+        let path_str = path.to_string_lossy();
+        if path.is_dir() {
+            return Self::open_split_dir(path);
+        }
+        if path_str.contains("-00001-of-") {
+            let dir = path.parent().unwrap_or(Path::new("."));
+            return Self::open_split_dir(dir);
+        }
+        Self::open_single(path)
+    }
+
+    fn open_single(path: &Path) -> Result<Self, String> {
         let mmap = Mmap::open(path)?;
-        let data = mmap.as_slice();
+        let data: &'static [u8] = unsafe { std::mem::transmute(mmap.as_slice()) };
+        let (metadata, tensors_raw, tensor_data_start, alignment) = parse_shard(data)?;
 
-        // Safety: we need the data slice to outlive the struct.
-        // Mmap is stored in the struct so it stays alive.
-        let data: &'static [u8] = unsafe { std::mem::transmute(data) };
+        let tensor_data_len = data.len() - tensor_data_start;
+        let tensors: Vec<TensorInfo> = tensors_raw.into_iter().map(|(name, dims, dtype, off)| {
+            TensorInfo { name, dims, dtype, offset: off, shard: 0, shard_offset: off }
+        }).collect();
 
-        let mut cur = Cursor::new(data);
-
-        // Header
-        let magic = cur.read_u32()?;
-        if magic != GGUF_MAGIC {
-            return Err(format!("bad magic: {magic:#x} (expected {GGUF_MAGIC:#x})"));
-        }
-        let version = cur.read_u32()?;
-        if version < 2 || version > 3 {
-            return Err(format!("unsupported GGUF version {version}"));
-        }
-        let tensor_count = cur.read_u64()? as usize;
-        let metadata_kv_count = cur.read_u64()? as usize;
-
-        eprintln!("gguf: version={version}, tensors={tensor_count}, metadata_kv={metadata_kv_count}");
-
-        // Metadata
-        let mut metadata = HashMap::with_capacity(metadata_kv_count);
-        for _ in 0..metadata_kv_count {
-            let key = cur.read_string()?;
-            let val = cur.read_meta_value()?;
-            metadata.insert(key, val);
-        }
-
-        // Alignment
-        let alignment = metadata.get("general.alignment")
-            .and_then(|v| v.as_u32())
-            .map(|v| v as usize)
-            .unwrap_or(DEFAULT_ALIGNMENT);
-
-        // Tensor info
-        let mut tensors = Vec::with_capacity(tensor_count);
-        for _ in 0..tensor_count {
-            let name = cur.read_string()?;
-            let ndim = cur.read_u32()? as usize;
-            let mut dims = Vec::with_capacity(ndim);
-            for _ in 0..ndim {
-                dims.push(cur.read_u64()?);
-            }
-            let type_id = cur.read_u32()?;
-            let dtype = GGMLType::from_u32(type_id)
-                .ok_or_else(|| format!("unknown ggml_type {type_id} for tensor '{name}'"))?;
-            let offset = cur.read_u64()?;
-            tensors.push(TensorInfo { name, dims, dtype, offset });
-        }
-
-        // Tensor data start (aligned after all headers)
-        let tensor_data_start = align(cur.pos, alignment);
-
-        // Extract model config
         let config = extract_config(&metadata)?;
+        print_summary(&config, &tensors, alignment, tensor_data_start);
 
-        eprintln!("gguf: arch={}, layers={}, hidden={}, heads={}, kv_heads={}, ffn={}, vocab={}",
-            config.arch, config.n_layers, config.hidden_dim, config.n_heads,
-            config.n_kv_heads, config.ffn_dim, config.vocab_size);
-        eprintln!("gguf: tensor_data_start={tensor_data_start:#x}, alignment={alignment}");
-
-        // Summary of tensor types
-        let mut type_counts: HashMap<GGMLType, (usize, u64)> = HashMap::new();
-        for t in &tensors {
-            let e = type_counts.entry(t.dtype).or_insert((0, 0));
-            e.0 += 1;
-            e.1 += t.byte_size();
-        }
-        for (dtype, (count, bytes)) in &type_counts {
-            eprintln!("gguf:   {:?}: {} tensors, {:.1}MB", dtype, count, *bytes as f64 / 1e6);
-        }
+        let shard = ShardInfo {
+            data, tensor_data_start, tensor_data_len, base_offset: 0,
+        };
 
         Ok(GGUFFile {
-            _mmap: mmap,
+            _mmaps: vec![mmap],
+            shards: vec![shard],
             data,
+            tensor_data_start,
             metadata,
             tensors,
-            tensor_data_start,
+            total_tensor_bytes: tensor_data_len as u64,
+            alignment,
+            config,
+        })
+    }
+
+    fn open_split_dir(dir: &Path) -> Result<Self, String> {
+        // Find all shard files sorted by number
+        let mut shard_paths: Vec<std::path::PathBuf> = Vec::new();
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x == "gguf").unwrap_or(false) {
+                shard_paths.push(p);
+            }
+        }
+        shard_paths.sort();
+        if shard_paths.is_empty() {
+            return Err(format!("no .gguf files in {}", dir.display()));
+        }
+        eprintln!("gguf: split model with {} shards", shard_paths.len());
+
+        let mut mmaps: Vec<Mmap> = Vec::new();
+        let mut all_tensors: Vec<TensorInfo> = Vec::new();
+        let mut metadata = HashMap::new();
+        let mut alignment = DEFAULT_ALIGNMENT;
+        let mut shard_infos: Vec<ShardInfo> = Vec::new();
+        let mut cumulative_offset: u64 = 0;
+
+        for (shard_idx, shard_path) in shard_paths.iter().enumerate() {
+            eprintln!("gguf: loading shard {}: {}", shard_idx, shard_path.display());
+            let mmap = Mmap::open(shard_path)?;
+            let data: &'static [u8] = unsafe { std::mem::transmute(mmap.as_slice()) };
+            let (shard_meta, tensors_raw, td_start, align_val) = parse_shard(data)?;
+
+            let td_len = data.len() - td_start;
+            eprintln!("gguf:   shard {}: {} tensors, {:.1}GB tensor data",
+                shard_idx, tensors_raw.len(), td_len as f64 / 1e9);
+
+            // First shard: take all metadata
+            if shard_idx == 0 {
+                metadata = shard_meta;
+                alignment = align_val;
+            }
+
+            // Convert tensors with global offsets
+            for (name, dims, dtype, local_off) in tensors_raw {
+                all_tensors.push(TensorInfo {
+                    name, dims, dtype,
+                    offset: cumulative_offset + local_off,
+                    shard: shard_idx,
+                    shard_offset: local_off,
+                });
+            }
+
+            shard_infos.push(ShardInfo {
+                data, tensor_data_start: td_start, tensor_data_len: td_len,
+                base_offset: cumulative_offset,
+            });
+            cumulative_offset += td_len as u64;
+            mmaps.push(mmap);
+        }
+
+        let config = extract_config(&metadata)?;
+        print_summary(&config, &all_tensors, alignment, shard_infos[0].tensor_data_start);
+
+        let first_data = shard_infos[0].data;
+        let first_td_start = shard_infos[0].tensor_data_start;
+
+        Ok(GGUFFile {
+            _mmaps: mmaps,
+            data: first_data,
+            tensor_data_start: first_td_start,
+            shards: shard_infos,
+            metadata,
+            tensors: all_tensors,
+            total_tensor_bytes: cumulative_offset,
             alignment,
             config,
         })
@@ -412,6 +458,81 @@ impl GGUFFile {
     /// Find tensor by name.
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
         self.tensors.iter().find(|t| t.name == name)
+    }
+
+    /// Get raw bytes for a tensor (from the correct shard).
+    pub fn tensor_data(&self, t: &TensorInfo) -> &[u8] {
+        let shard = &self.shards[t.shard];
+        let start = shard.tensor_data_start + t.shard_offset as usize;
+        let len = t.byte_size() as usize;
+        &shard.data[start..start + len]
+    }
+
+    /// Is this a split (multi-shard) model?
+    pub fn is_split(&self) -> bool { self.shards.len() > 1 }
+}
+
+/// Parse a single shard: returns (metadata, tensors_raw, tensor_data_start, alignment).
+fn parse_shard(data: &[u8]) -> Result<(
+    HashMap<String, MetaValue>,
+    Vec<(String, Vec<u64>, GGMLType, u64)>,
+    usize, usize,
+), String> {
+    let mut cur = Cursor::new(data);
+    let magic = cur.read_u32()?;
+    if magic != GGUF_MAGIC {
+        return Err(format!("bad magic: {magic:#x} (expected {GGUF_MAGIC:#x})"));
+    }
+    let version = cur.read_u32()?;
+    if version < 2 || version > 3 {
+        return Err(format!("unsupported GGUF version {version}"));
+    }
+    let tensor_count = cur.read_u64()? as usize;
+    let metadata_kv_count = cur.read_u64()? as usize;
+
+    let mut metadata = HashMap::with_capacity(metadata_kv_count);
+    for _ in 0..metadata_kv_count {
+        let key = cur.read_string()?;
+        let val = cur.read_meta_value()?;
+        metadata.insert(key, val);
+    }
+
+    let alignment = metadata.get("general.alignment")
+        .and_then(|v| v.as_u32())
+        .map(|v| v as usize)
+        .unwrap_or(DEFAULT_ALIGNMENT);
+
+    let mut tensors = Vec::with_capacity(tensor_count);
+    for _ in 0..tensor_count {
+        let name = cur.read_string()?;
+        let ndim = cur.read_u32()? as usize;
+        let mut dims = Vec::with_capacity(ndim);
+        for _ in 0..ndim { dims.push(cur.read_u64()?); }
+        let type_id = cur.read_u32()?;
+        let dtype = GGMLType::from_u32(type_id)
+            .ok_or_else(|| format!("unknown ggml_type {type_id} for tensor '{name}'"))?;
+        let offset = cur.read_u64()?;
+        tensors.push((name, dims, dtype, offset));
+    }
+
+    let tensor_data_start = align(cur.pos, alignment);
+    Ok((metadata, tensors, tensor_data_start, alignment))
+}
+
+fn print_summary(config: &ModelConfig, tensors: &[TensorInfo], alignment: usize, td_start: usize) {
+    eprintln!("gguf: arch={}, layers={}, hidden={}, heads={}, kv_heads={}, ffn={}, vocab={}",
+        config.arch, config.n_layers, config.hidden_dim, config.n_heads,
+        config.n_kv_heads, config.ffn_dim, config.vocab_size);
+    eprintln!("gguf: tensor_data_start={td_start:#x}, alignment={alignment}");
+
+    let mut type_counts: HashMap<GGMLType, (usize, u64)> = HashMap::new();
+    for t in tensors {
+        let e = type_counts.entry(t.dtype).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += t.byte_size();
+    }
+    for (dtype, (count, bytes)) in &type_counts {
+        eprintln!("gguf:   {:?}: {} tensors, {:.1}MB", dtype, count, *bytes as f64 / 1e6);
     }
 }
 

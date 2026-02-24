@@ -1,10 +1,10 @@
-//! Metal compute kernels for Llama-3.2 inference.
-//! Q4_0/Q4_1/Q6_K dequant fused into matvec. All matvec kernels use simdgroup
-//! parallelism: 8 rows per threadgroup (256 threads = 8 simdgroups of 32).
+//! Metal compute kernels for Llama inference.
+//! Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0 dequant fused into matvec. All matvec kernels use
+//! simdgroup parallelism: 8 rows per threadgroup (256 threads = 8 simdgroups of 32).
 //! Element-wise ops (RMSNorm, RoPE, SiLU, attention) in single command buffer.
 
 pub fn all_kernels() -> String {
-    format!("{HEADER}{RMSNORM}{MATVEC_Q4_0}{MATVEC_Q4_1}{MATVEC_Q4K}{MATVEC_Q6K}{MATVEC_Q4_0_ADD}{MATVEC_Q4_1_ADD}{MATVEC_Q4K_ADD}{MATVEC_Q6K_ADD}{EMBED_Q4_0}{EMBED_Q6K}{ROPE}{KV_STORE}{ATTENTION}{SILU_MUL}{ARGMAX}")
+    format!("{HEADER}{RMSNORM}{MATVEC_Q4_0}{MATVEC_Q4_1}{MATVEC_Q4K}{MATVEC_Q5K}{MATVEC_Q6K}{MATVEC_Q8_0}{MATVEC_Q4_0_ADD}{MATVEC_Q4_1_ADD}{MATVEC_Q4K_ADD}{MATVEC_Q5K_ADD}{MATVEC_Q6K_ADD}{MATVEC_Q8_0_ADD}{EMBED_Q4_0}{EMBED_Q5K}{EMBED_Q6K}{EMBED_Q8_0}{ROPE}{KV_STORE}{ATTENTION}{SILU_MUL}{ARGMAX}")
 }
 
 const HEADER: &str = r#"
@@ -172,6 +172,98 @@ kernel void matvec_q6k(
         }
     }
 
+    sum = simd_sum(sum);
+    if (simd_lid == 0) y[row_idx] = sum;
+}
+"#;
+
+/// Q5_K dequant matvec: y = W_q5k @ x.
+/// Q5_K: 256 values/block, 176 bytes/block (2B d, 2B dmin, 12B scales, 32B qh, 128B qs)
+/// Same scale packing as Q4_K. High bits in qh add bit4 to each 4-bit quant.
+/// Each simdgroup (32 threads) handles one row.
+const MATVEC_Q5K: &str = r#"
+inline void get_scale_min_k5(int j, device const uchar *q, thread float &sc, thread float &mn) {
+    if (j < 4) { sc = float(q[j] & 63); mn = float(q[j + 4] & 63); }
+    else { sc = float((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4)); mn = float((q[j + 4] >> 4) | ((q[j] >> 6) << 4)); }
+}
+kernel void matvec_q5k(
+    device const uchar *W    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device float       *y    [[buffer(2)]],
+    constant uint      &cols [[buffer(3)]],
+    constant uint      &rows [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint num_sg [[simdgroups_per_threadgroup]]
+) {
+    uint row_idx = tgid * num_sg + simd_gid;
+    if (row_idx >= rows) return;
+    uint blocks_per_row = cols / 256;
+    device const uchar *row = W + row_idx * blocks_per_row * 176;
+    float sum = 0.0;
+    for (uint b = simd_lid; b < blocks_per_row; b += 32) {
+        device const uchar *blk = row + b * 176;
+        float d    = float(*((device const half *)(blk)));
+        float dmin = float(*((device const half *)(blk + 2)));
+        device const uchar *scales = blk + 4;
+        device const uchar *qh = blk + 16;
+        device const uchar *qs = blk + 48;
+        uint base = b * 256;
+        for (int pair = 0; pair < 4; pair++) {
+            int is0 = pair * 2, is1 = pair * 2 + 1;
+            float sc0, mn0, sc1, mn1;
+            get_scale_min_k5(is0, scales, sc0, mn0);
+            get_scale_min_k5(is1, scales, sc1, mn1);
+            float ds0 = d * sc0, dm0 = dmin * mn0;
+            float ds1 = d * sc1, dm1 = dmin * mn1;
+            device const uchar *qp = qs + pair * 32;
+            uint idx = base + pair * 64;
+            uint shift0 = pair * 2, shift1 = pair * 2 + 1;
+            for (uint l = 0; l < 32; l++) {
+                uchar qb = qp[l];
+                uint hb0 = (qh[l] >> shift0) & 1;
+                uint hb1 = (qh[l] >> shift1) & 1;
+                sum += (ds0 * float((qb & 0xF) + hb0 * 16) - dm0) * x[idx + l];
+                sum += (ds1 * float((qb >> 4)  + hb1 * 16) - dm1) * x[idx + 32 + l];
+            }
+        }
+    }
+    sum = simd_sum(sum);
+    if (simd_lid == 0) y[row_idx] = sum;
+}
+"#;
+
+/// Q8_0 dequant matvec: y = W_q8_0 @ x.
+/// Q8_0: 32 values/block, 34 bytes/block (2B half d + 32B int8 quants)
+/// Simplest K-quant: val = d * q[i]. No min offset, no high bits.
+const MATVEC_Q8_0: &str = r#"
+kernel void matvec_q8_0(
+    device const uchar *W    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device float       *y    [[buffer(2)]],
+    constant uint      &cols [[buffer(3)]],
+    constant uint      &rows [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint num_sg [[simdgroups_per_threadgroup]]
+) {
+    uint row_idx = tgid * num_sg + simd_gid;
+    if (row_idx >= rows) return;
+    uint blocks_per_row = cols / 32;
+    uint row_bytes = blocks_per_row * 34;
+    device const uchar *row = W + row_idx * row_bytes;
+    float sum = 0.0;
+    for (uint b = simd_lid; b < blocks_per_row; b += 32) {
+        device const uchar *blk = row + b * 34;
+        float d = float(*((device const half *)(blk)));
+        device const char *qs = (device const char *)(blk + 2);
+        uint base = b * 32;
+        for (uint i = 0; i < 32; i++) {
+            sum += d * float(qs[i]) * x[base + i];
+        }
+    }
     sum = simd_sum(sum);
     if (simd_lid == 0) y[row_idx] = sum;
 }
@@ -351,6 +443,60 @@ kernel void matvec_q4k_add(
 }
 "#;
 
+/// Fused Q5_K matvec + residual add. Simdgroup-per-row pattern.
+const MATVEC_Q5K_ADD: &str = r#"
+inline void get_scale_min_k5_add(int j, device const uchar *q, thread float &sc, thread float &mn) {
+    if (j < 4) { sc = float(q[j] & 63); mn = float(q[j + 4] & 63); }
+    else { sc = float((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4)); mn = float((q[j + 4] >> 4) | ((q[j] >> 6) << 4)); }
+}
+kernel void matvec_q5k_add(
+    device const uchar *W    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device float       *res  [[buffer(2)]],
+    constant uint      &cols [[buffer(3)]],
+    constant uint      &rows [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint num_sg [[simdgroups_per_threadgroup]]
+) {
+    uint row_idx = tgid * num_sg + simd_gid;
+    if (row_idx >= rows) return;
+    uint blocks_per_row = cols / 256;
+    device const uchar *row = W + row_idx * blocks_per_row * 176;
+    float sum = 0.0;
+    for (uint b = simd_lid; b < blocks_per_row; b += 32) {
+        device const uchar *blk = row + b * 176;
+        float d    = float(*((device const half *)(blk)));
+        float dmin = float(*((device const half *)(blk + 2)));
+        device const uchar *scales = blk + 4;
+        device const uchar *qh = blk + 16;
+        device const uchar *qs = blk + 48;
+        uint base = b * 256;
+        for (int pair = 0; pair < 4; pair++) {
+            int is0 = pair * 2, is1 = pair * 2 + 1;
+            float sc0, mn0, sc1, mn1;
+            get_scale_min_k5_add(is0, scales, sc0, mn0);
+            get_scale_min_k5_add(is1, scales, sc1, mn1);
+            float ds0 = d * sc0, dm0 = dmin * mn0;
+            float ds1 = d * sc1, dm1 = dmin * mn1;
+            device const uchar *qp = qs + pair * 32;
+            uint idx = base + pair * 64;
+            uint shift0 = pair * 2, shift1 = pair * 2 + 1;
+            for (uint l = 0; l < 32; l++) {
+                uchar qb = qp[l];
+                uint hb0 = (qh[l] >> shift0) & 1;
+                uint hb1 = (qh[l] >> shift1) & 1;
+                sum += (ds0 * float((qb & 0xF) + hb0 * 16) - dm0) * x[idx + l];
+                sum += (ds1 * float((qb >> 4)  + hb1 * 16) - dm1) * x[idx + 32 + l];
+            }
+        }
+    }
+    sum = simd_sum(sum);
+    if (simd_lid == 0) res[row_idx] += sum;
+}
+"#;
+
 /// Fused Q6_K matvec + residual add. Simdgroup-per-row pattern.
 const MATVEC_Q6K_ADD: &str = r#"
 kernel void matvec_q6k_add(
@@ -402,6 +548,39 @@ kernel void matvec_q6k_add(
 }
 "#;
 
+/// Fused Q8_0 matvec + residual add. Simdgroup-per-row pattern.
+const MATVEC_Q8_0_ADD: &str = r#"
+kernel void matvec_q8_0_add(
+    device const uchar *W    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device float       *res  [[buffer(2)]],
+    constant uint      &cols [[buffer(3)]],
+    constant uint      &rows [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint num_sg [[simdgroups_per_threadgroup]]
+) {
+    uint row_idx = tgid * num_sg + simd_gid;
+    if (row_idx >= rows) return;
+    uint blocks_per_row = cols / 32;
+    uint row_bytes = blocks_per_row * 34;
+    device const uchar *row = W + row_idx * row_bytes;
+    float sum = 0.0;
+    for (uint b = simd_lid; b < blocks_per_row; b += 32) {
+        device const uchar *blk = row + b * 34;
+        float d = float(*((device const half *)(blk)));
+        device const char *qs = (device const char *)(blk + 2);
+        uint base = b * 32;
+        for (uint i = 0; i < 32; i++) {
+            sum += d * float(qs[i]) * x[base + i];
+        }
+    }
+    sum = simd_sum(sum);
+    if (simd_lid == 0) res[row_idx] += sum;
+}
+"#;
+
 /// Dequant single row from Q4_0 embedding table.
 /// Launch with dim threads. Q4_0: 32 vals/block, 18 bytes/block.
 const EMBED_Q4_0: &str = r#"
@@ -422,6 +601,47 @@ kernel void embed_q4_0(
     uchar qb = qs[vi < 16 ? vi : vi - 16];
     float q = (vi < 16) ? float(qb & 0xF) - 8.0 : float(qb >> 4) - 8.0;
     out[gid] = d * q;
+}
+"#;
+
+/// Dequant single row from Q5_K embedding table.
+/// Launch with dim threads. Q5_K: 256 vals/block, 176 bytes/block.
+const EMBED_Q5K: &str = r#"
+inline void get_scale_min_k5_embed(int j, device const uchar *q, thread float &sc, thread float &mn) {
+    if (j < 4) { sc = float(q[j] & 63); mn = float(q[j + 4] & 63); }
+    else { sc = float((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4)); mn = float((q[j + 4] >> 4) | ((q[j] >> 6) << 4)); }
+}
+kernel void embed_q5k(
+    device const uchar *W        [[buffer(0)]],
+    device float       *out      [[buffer(1)]],
+    constant uint      &dim      [[buffer(2)]],
+    constant uint      &token_id [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= dim) return;
+    uint bpr = dim / 256;
+    device const uchar *blk = W + token_id * bpr * 176 + (gid / 256) * 176;
+    float d    = float(*((device const half *)(blk)));
+    float dmin = float(*((device const half *)(blk + 2)));
+    device const uchar *scales = blk + 4;
+    device const uchar *qh = blk + 16;
+    device const uchar *qs = blk + 48;
+    uint vi = gid % 256;
+    uint pair = vi / 64;
+    uint rem = vi % 64;
+    uint l = rem % 32;
+    uint half_idx = rem / 32;
+    int is_idx = pair * 2 + half_idx;
+    float sc, mn;
+    get_scale_min_k5_embed(is_idx, scales, sc, mn);
+    float ds = d * sc, dm = dmin * mn;
+    uchar qb = qs[pair * 32 + l];
+    uint shift = pair * 2 + half_idx;
+    uint hb = (qh[l] >> shift) & 1;
+    uint q;
+    if (half_idx == 0) { q = (qb & 0xF) + hb * 16; }
+    else               { q = (qb >> 4)  + hb * 16; }
+    out[gid] = ds * float(q) - dm;
 }
 "#;
 
@@ -456,6 +676,27 @@ kernel void embed_q6k(
         case 3: q = (int(qlp[l+32]  >> 4) | (int((qhp[l] >> 6) & 3) << 4)) - 32; s = d * float(sc[sb+is+6]); break;
     }
     out[gid] = s * float(q);
+}
+"#;
+
+/// Dequant single row from Q8_0 embedding table.
+/// Launch with dim threads. Q8_0: 32 vals/block, 34 bytes/block.
+const EMBED_Q8_0: &str = r#"
+kernel void embed_q8_0(
+    device const uchar *W        [[buffer(0)]],
+    device float       *out      [[buffer(1)]],
+    constant uint      &dim      [[buffer(2)]],
+    constant uint      &token_id [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= dim) return;
+    uint bpr = dim / 32;
+    device const uchar *row = W + token_id * bpr * 34;
+    uint bi = gid / 32, vi = gid % 32;
+    device const uchar *blk = row + bi * 34;
+    float d = float(*((device const half *)(blk)));
+    device const char *qs = (device const char *)(blk + 2);
+    out[gid] = d * float(qs[vi]);
 }
 "#;
 
