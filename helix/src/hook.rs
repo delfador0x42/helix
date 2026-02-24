@@ -82,6 +82,41 @@ fn idx_search_or(data: &[u8], query: &str, limit: usize) -> Vec<crate::index::Se
         .unwrap_or_default()
 }
 
+/// Search within a topic hierarchy prefix. Returns snippets for entries under the prefix.
+fn topic_prefix_entries(data: &[u8], prefix: &str, limit: usize) -> Vec<crate::index::SearchHit> {
+    let topics = crate::index::topic_table(data).unwrap_or_default();
+    let matching_ids: Vec<u16> = topics.iter()
+        .filter(|(_, name, _)| crate::config::topic_matches_query(name, prefix))
+        .map(|(id, _, _)| *id)
+        .collect();
+    if matching_ids.is_empty() { return Vec::new(); }
+    let pred = crate::index::FilterPred {
+        topic_filter: crate::index::TopicFilter::Prefix(matching_ids),
+        after_days: 0, before_days: u16::MAX, tag_mask: 0, source_needle: None,
+    };
+    // Search with stem of the prefix as query to get relevant entries
+    let leaf = prefix.rsplit('/').next().unwrap_or(prefix);
+    crate::index::search_index(data, leaf, &pred, limit, false).unwrap_or_default()
+}
+
+/// Derive a topic prefix from a file path by finding the project root name.
+/// E.g. "/Users/foo/wudan/iris/Packages/Security/Services/Scanner.swift" → "iris"
+fn derive_topic_prefix(file_path: &str) -> Option<String> {
+    let p = std::path::Path::new(file_path);
+    let markers = ["Cargo.toml", "Package.swift", ".git", "Makefile", "build.rs"];
+    let mut dir = p.parent()?;
+    for _ in 0..8 {
+        for m in &markers {
+            if dir.join(m).exists() {
+                return dir.file_name().and_then(|n| n.to_str())
+                    .map(|s| crate::config::sanitize_topic(s));
+            }
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
 /// Find entry IDs with [source:] metadata matching filename.
 fn source_entries_for_file(data: &[u8], filename: &str) -> Vec<u32> {
     crate::index::sourced_entries(data).unwrap_or_default()
@@ -595,6 +630,19 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], mu
     }
     let l1 = pool.len() - l1_start;
 
+    // Layer 1.5: Topic hierarchy — entries from the project's topic subtree
+    let l1h_start = pool.len();
+    let topic_prefix = derive_topic_prefix(file_path);
+    if let Some(ref prefix) = topic_prefix {
+        for h in topic_prefix_entries(data, prefix, 5) {
+            if seen.insert(h.entry_id) {
+                pool.push(std::borrow::Cow::Owned(h.snippet));
+                if pool.len() - l1h_start >= 3 { break; }
+            }
+        }
+    }
+    let l1h = pool.len() - l1h_start;
+
     // Layer 2: Symbol-based OR search (skip if L1 ≥ 5)
     let l2_start = pool.len();
     if source_ids.len() < 5 {
@@ -765,17 +813,22 @@ pub fn query_ambient(data: &[u8], stem: &str, file_path: &str, syms: &[&str], mu
         + code_blast.iter().map(|s| s.len() + 4).sum::<usize>()
         + code_analysis.iter().map(|s| s.len() + 4).sum::<usize>();
     let mut out = String::with_capacity(est);
-    let counts = [l1, l2, l3, l4, l5];
+    let counts = [l1, l1h, l2, l3, l4, l5];
     let mut pool_idx = 0;
     for (i, &count) in counts.iter().enumerate() {
         if count == 0 { continue; }
         if !out.is_empty() { out.push_str("---\n"); }
         match i {
             0 => { out.push_str("source-linked ("); out.push_str(filename); out.push_str("):\n"); }
-            1 => out.push_str("symbol context:\n"),
-            2 => { out.push_str("related ("); out.push_str(stem); out.push_str("):\n"); }
-            3 => out.push_str("structural coupling:\n"),
-            4 => {
+            1 => {
+                out.push_str("topic context (");
+                out.push_str(topic_prefix.as_deref().unwrap_or("?"));
+                out.push_str("/*):\n");
+            }
+            2 => out.push_str("symbol context:\n"),
+            3 => { out.push_str("related ("); out.push_str(stem); out.push_str("):\n"); }
+            4 => out.push_str("structural coupling:\n"),
+            5 => {
                 out.push_str("REFACTOR IMPACT (symbols modified: ");
                 for (j, sym) in syms.iter().enumerate() {
                     if j > 0 { out.push_str(", "); }

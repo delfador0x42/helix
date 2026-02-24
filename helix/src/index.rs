@@ -284,8 +284,15 @@ pub fn rebuild(dir: &Path, persist: bool) -> Result<(String, Vec<u8>), String> {
 
 // ══════════ Query: FilterPred + QueryState ══════════
 
+/// Topic filter: None (any), exact ID, or set of IDs (prefix match).
+pub enum TopicFilter {
+    Any,
+    Exact(u16),
+    Prefix(Vec<u16>),
+}
+
 pub struct FilterPred {
-    pub topic_id: Option<u16>,
+    pub topic_filter: TopicFilter,
     pub after_days: u16,
     pub before_days: u16,
     pub tag_mask: u32,
@@ -294,10 +301,14 @@ pub struct FilterPred {
 
 impl FilterPred {
     pub fn none() -> Self {
-        Self { topic_id: None, after_days: 0, before_days: u16::MAX, tag_mask: 0, source_needle: None }
+        Self { topic_filter: TopicFilter::Any, after_days: 0, before_days: u16::MAX, tag_mask: 0, source_needle: None }
     }
     fn passes(&self, m: &EntryMeta, data: &[u8], src_pool: usize) -> bool {
-        if let Some(t) = self.topic_id { if { m.topic_id } != t { return false; } }
+        match &self.topic_filter {
+            TopicFilter::Any => {}
+            TopicFilter::Exact(t) => { if { m.topic_id } != *t { return false; } }
+            TopicFilter::Prefix(ids) => { if !ids.contains(&{ m.topic_id }) { return false; } }
+        }
         let ed = { m.epoch_days };
         if ed < self.after_days || (self.before_days < u16::MAX && ed > self.before_days) { return false; }
         if self.tag_mask != 0 && ({ m.tag_bitmap } & self.tag_mask) != self.tag_mask { return false; }
@@ -741,8 +752,26 @@ pub fn search_scored(dir: &Path, terms: &[String], filter: &Filter, limit: Optio
 }
 
 fn build_filter_pred(data: &[u8], filter: &Filter) -> FilterPred {
+    let topic_filter = match filter.topic.as_ref() {
+        None => TopicFilter::Any,
+        Some(name) => {
+            // Try exact match first
+            if let Some(id) = resolve_topic(data, name) {
+                TopicFilter::Exact(id)
+            } else {
+                // Prefix match: find all topics under this hierarchy
+                let ids: Vec<u16> = topic_table(data).unwrap_or_default().iter()
+                    .filter(|(_, n, _)| crate::config::topic_matches_query(n, name))
+                    .map(|(id, _, _)| *id)
+                    .collect();
+                if ids.is_empty() { TopicFilter::Any }
+                else if ids.len() == 1 { TopicFilter::Exact(ids[0]) }
+                else { TopicFilter::Prefix(ids) }
+            }
+        }
+    };
     FilterPred {
-        topic_id: filter.topic.as_ref().and_then(|n| resolve_topic(data, n)),
+        topic_filter,
         after_days: filter.after.map(|d| d.max(0) as u16).unwrap_or(0),
         before_days: filter.before.map(|d| d.min(u16::MAX as i64) as u16).unwrap_or(u16::MAX),
         tag_mask: filter.tag.as_ref().and_then(|t| resolve_tag(data, t)).map(|b| 1u32 << b).unwrap_or(0),
@@ -850,7 +879,9 @@ fn score_on_cache(dir: &Path, terms: &[String], filter: &Filter, limit: Option<u
     crate::cache::with_corpus(dir, |cached| {
         let filtered: Vec<&crate::cache::CachedEntry> = cached.iter()
             .filter(|e| {
-                if let Some(ref t) = filter.topic { if *e.topic != **t { return false; } }
+                if let Some(ref t) = filter.topic {
+                    if !crate::config::topic_matches_query(e.topic.as_str(), t) { return false; }
+                }
                 passes_filter(e, filter)
             }).collect();
         let n = filtered.len() as f64;
@@ -906,7 +937,9 @@ pub fn topic_matches(dir: &Path, terms: &[String], filter: &Filter)
         let count_fn = |mode: SearchMode| -> Vec<(String, usize)> {
             let mut hits: FxHashMap<&str, usize> = FxHashMap::default();
             for e in cached {
-                if let Some(ref t) = filter.topic { if *e.topic != **t { continue; } }
+                if let Some(ref t) = filter.topic {
+                    if !crate::config::topic_matches_query(e.topic.as_str(), t) { continue; }
+                }
                 if !passes_filter(e, filter) { continue; }
                 if matches_tokens(&e.tf_map, terms, mode) { *hits.entry(&e.topic).or_insert(0) += 1; }
             }
@@ -930,7 +963,9 @@ pub fn count_matches(dir: &Path, terms: &[String], filter: &Filter)
             let mut total = 0;
             let mut topics: FxHashSet<&str> = FxHashSet::default();
             for e in cached {
-                if let Some(ref t) = filter.topic { if *e.topic != **t { continue; } }
+                if let Some(ref t) = filter.topic {
+                    if !crate::config::topic_matches_query(e.topic.as_str(), t) { continue; }
+                }
                 if !passes_filter(e, filter) { continue; }
                 if matches_tokens(&e.tf_map, terms, mode) { total += 1; topics.insert(&e.topic); }
             }

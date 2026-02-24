@@ -9,15 +9,31 @@ use crate::model::Model;
 use crate::kernels_batch;
 use std::ffi::c_void;
 
+/// Grid tile size for MMA kernels. Matches register-optimal v3b at B=80.
+const TILE_B: u32 = 80;
+
+/// Maximum batch size supported (tokens per forward pass).
+/// Buffers padded to next multiple of TILE_B for grid-tiled dispatch.
+const MAX_BATCH: u32 = 1024;
+const MAX_BATCH_PADDED: u32 = (MAX_BATCH + TILE_B - 1) / TILE_B * TILE_B; // 1040
+
 /// Batch inference state: FP16 buffers + batch pipelines layered on top of Model.
 pub struct BatchState {
     pub batch_size: u32,
-    // Batch pipelines — hybrid matmul
-    pub p_q4_0_mma: Pipeline,          // v3b: quantized Q4_0 MMA (primary for Q4_0)
-    pub p_fp16_mma: Pipeline,          // Pure FP16 MMA (primary for Q4_1/Q6K)
-    pub p_matmul_q4_0_f16: Pipeline,   // Scalar fallback (unused but compiled)
+    // Grid-tiled MMA pipelines (primary — supports any B via grid_y)
+    pub p_q4_0_grid: Pipeline,         // Grid-tiled v3b: Q4_0, tile_b=80
+    pub p_fp16_grid: Pipeline,         // Grid-tiled FP16 MMA: tile_b=80
+    // Legacy pipelines (kept for benchmarking reference)
+    pub p_q4_0_mma: Pipeline,          // v3b: B=80 baked in
+    pub p_fp16_mma: Pipeline,          // FP16 MMA 256-thread, B=80 baked in
+    pub p_fp16_mma_128: Pipeline,      // FP16 MMA 128-thread, B=80 baked in
+    pub p_matmul_q4_0_f16: Pipeline,   // Scalar B=80
     pub p_matmul_q4_1_f16: Pipeline,
     pub p_matmul_q6k_f16: Pipeline,
+    // n=1 scalar matvec: single-token decode through batch path
+    pub p_matvec_q4_0: Pipeline,
+    pub p_matvec_q4_1: Pipeline,
+    pub p_matvec_q6k: Pipeline,
     pub p_embed_fp16: Pipeline,
     pub p_embed_q4_0: Pipeline,
     pub p_embed_q6k: Pipeline,
@@ -51,7 +67,7 @@ const MAX_SEQ: u32 = 2048;
 
 impl BatchState {
     pub fn new(model: &Model) -> Result<Self, String> {
-        let bs = kernels_batch::BATCH_SIZE;
+        let bs = MAX_BATCH;
         let cfg = &model.cfg;
 
         let src = kernels_batch::all_batch_kernels();
@@ -62,11 +78,17 @@ impl BatchState {
             model.device.new_compute_pipeline(&f)
         };
 
+        let p_q4_0_grid = pipe("matmul_q4_0_mma_grid")?;
+        let p_fp16_grid = pipe("matmul_fp16_mma_grid")?;
         let p_q4_0_mma = pipe("matmul_q4_0_mma")?;
         let p_fp16_mma = pipe("matmul_fp16_mma")?;
+        let p_fp16_mma_128 = pipe("matmul_fp16_mma_128")?;
         let p_matmul_q4_0_f16 = pipe("matmul_q4_0_f16")?;
         let p_matmul_q4_1_f16 = pipe("matmul_q4_1_f16")?;
         let p_matmul_q6k_f16 = pipe("matmul_q6k_f16")?;
+        let p_matvec_q4_0 = pipe("matvec_q4_0_f16")?;
+        let p_matvec_q4_1 = pipe("matvec_q4_1_f16")?;
+        let p_matvec_q6k = pipe("matvec_q6k_f16")?;
         let p_embed_fp16 = pipe("embed_fp16")?;
         let p_embed_q4_0 = pipe("embed_batch_q4_0")?;
         let p_embed_q6k = pipe("embed_batch_q6k")?;
@@ -81,7 +103,7 @@ impl BatchState {
 
         let dev = &model.device;
         let h = |n: u64| dev.new_buffer(n * 2);
-        let bp = kernels_batch::BATCH_PADDED as u64;
+        let bp = MAX_BATCH_PADDED as u64;
         let hidden = cfg.hidden_dim as u64;
         let q_dim = model.q_dim as u64;
         let kv_dim = model.kv_dim as u64;
@@ -109,13 +131,16 @@ impl BatchState {
             v_cache.push(dev.new_buffer(kv_size));
         }
 
-        eprintln!("batch: B={bs}, hybrid dispatch (v3b Q4_0 + FP16 MMA), KV cache {:.1}MB",
+        let buf_mb = bp as f64 * (hidden + hidden + q_dim + kv_dim + kv_dim + q_dim + ffn + ffn + ffn + vocab) as f64 * 2.0 / 1e6;
+        eprintln!("batch: max_B={bs} (padded={bp}), grid-tiled tile_b={TILE_B}, bufs={buf_mb:.0}MB, KV cache={:.0}MB",
             kv_size as f64 * 2.0 * cfg.n_layers as f64 / 1e6);
 
         Ok(BatchState {
             batch_size: bs,
-            p_q4_0_mma, p_fp16_mma,
+            p_q4_0_grid, p_fp16_grid,
+            p_q4_0_mma, p_fp16_mma, p_fp16_mma_128,
             p_matmul_q4_0_f16, p_matmul_q4_1_f16, p_matmul_q6k_f16,
+            p_matvec_q4_0, p_matvec_q4_1, p_matvec_q6k,
             p_residual_rmsnorm,
             p_embed_fp16, p_embed_q4_0, p_embed_q6k,
             p_rmsnorm, p_rope, p_kv_store, p_silu_mul,
@@ -131,10 +156,11 @@ impl BatchState {
 pub fn forward_batch(
     model: &Model, batch: &BatchState, tokens: &[u32], start_pos: u32,
 ) {
-    forward_batch_n(model, batch, tokens, start_pos, batch.batch_size);
+    forward_batch_n(model, batch, tokens, start_pos, tokens.len() as u32);
 }
 
-/// Variable-count batch forward: process `n` tokens (1..=batch_size).
+/// Variable-count batch forward: process `n` tokens (1..=MAX_BATCH).
+/// Uses grid-tiled dispatch for any n — no compile-time batch limit.
 pub fn forward_batch_n(
     model: &Model, batch: &BatchState, tokens: &[u32],
     start_pos: u32, n: u32,
@@ -142,7 +168,7 @@ pub fn forward_batch_n(
     let cfg = &model.cfg;
     let b = n;
     assert!(tokens.len() >= n as usize);
-    assert!(n <= batch.batch_size);
+    assert!(n <= MAX_BATCH, "n={n} exceeds MAX_BATCH={MAX_BATCH}");
 
     unsafe {
         let dst = batch.tokens_buf.contents() as *mut u32;
@@ -229,10 +255,10 @@ pub fn forward_batch_n(
     cmd.wait_until_completed();
 }
 
-/// Read batch argmax results from GPU.
-pub fn argmax_batch(batch: &BatchState) -> Vec<u32> {
+/// Read batch argmax results from GPU (n items).
+pub fn argmax_batch(batch: &BatchState, n: u32) -> Vec<u32> {
     let ptr = batch.argmax_buf.contents() as *const u32;
-    (0..batch.batch_size as usize)
+    (0..n as usize)
         .map(|i| unsafe { *ptr.add(i) })
         .collect()
 }
@@ -243,14 +269,15 @@ pub fn argmax_one(batch: &BatchState) -> u32 {
 }
 
 /// Prefill a prompt using batch forward pass.
+/// Uses optimal chunk size (up to MAX_BATCH) for grid-tiled dispatch.
 pub fn prefill(model: &Model, batch: &BatchState, prompt: &[u32]) -> u32 {
-    let bs = batch.batch_size as usize;
+    let bs = MAX_BATCH as usize;
     let mut pos = 0u32;
     let full_chunks = prompt.len() / bs;
     for c in 0..full_chunks {
         let chunk = &prompt[c * bs..(c + 1) * bs];
-        forward_batch_n(model, batch, chunk, pos, batch.batch_size);
-        pos += batch.batch_size;
+        forward_batch_n(model, batch, chunk, pos, MAX_BATCH);
+        pos += MAX_BATCH;
     }
     let rem = prompt.len() % bs;
     if rem > 0 {
@@ -280,6 +307,154 @@ pub fn generate(
         next = decode_step(model, batch, next, pos + i);
     }
     generated
+}
+
+/// Profiled forward pass: times each operation group separately.
+/// Uses separate command buffers for each group (serializes GPU work).
+/// Returns (total_ms, matmul_ms, attention_ms, elementwise_ms, output_ms).
+pub fn forward_profiled(
+    model: &Model, batch: &BatchState, tokens: &[u32],
+    start_pos: u32, n: u32,
+) -> (f64, f64, f64, f64, f64) {
+    let cfg = &model.cfg;
+    let b = n;
+    unsafe {
+        let dst = batch.tokens_buf.contents() as *mut u32;
+        std::ptr::copy_nonoverlapping(tokens.as_ptr(), dst, n as usize);
+    }
+
+    let mut matmul_us = 0.0f64;
+    let mut attn_us = 0.0f64;
+    let mut elem_us = 0.0f64;
+    let mut output_us = 0.0f64;
+
+    // Helper: time a closure that emits dispatches
+    let time_gpu = |f: &dyn Fn(&ComputeEncoder)| -> f64 {
+        let cmd = model.queue.new_command_buffer();
+        let enc = cmd.new_compute_encoder();
+        f(&enc);
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        0.0 // We'll use wall clock instead
+    };
+    let _ = time_gpu; // unused, using wall clock
+
+    macro_rules! timed {
+        ($acc:expr, $body:expr) => {{
+            let cmd = model.queue.new_command_buffer();
+            let enc = cmd.new_compute_encoder();
+            $body(&enc);
+            enc.end_encoding();
+            let t = std::time::Instant::now();
+            cmd.commit();
+            cmd.wait_until_completed();
+            $acc += t.elapsed().as_nanos() as f64 / 1000.0;
+        }};
+    }
+
+    // Embedding
+    timed!(elem_us, |enc: &ComputeEncoder| {
+        dispatch_embed_fp16(enc, model, batch, b);
+    });
+
+    for layer in 0..cfg.n_layers as usize {
+        let lo = &model.layers[layer];
+
+        // Attn RMSNorm
+        timed!(elem_us, |enc: &ComputeEncoder| {
+            dispatch_rmsnorm_batch(enc, batch, &batch.x, &batch.norm_out,
+                &model.weights, lo.attn_norm, cfg.hidden_dim, b);
+        });
+
+        // QKV matmuls
+        timed!(matmul_us, |enc: &ComputeEncoder| {
+            dispatch_matmul(enc, model, batch, lo.attn_q_type,
+                lo.attn_q, lo.fp16_attn_q,
+                &batch.norm_out, &batch.q, cfg.hidden_dim, model.q_dim, b);
+            dispatch_matmul(enc, model, batch, lo.attn_k_type,
+                lo.attn_k, lo.fp16_attn_k,
+                &batch.norm_out, &batch.k, cfg.hidden_dim, model.kv_dim, b);
+            dispatch_matmul(enc, model, batch, lo.attn_v_type,
+                lo.attn_v, lo.fp16_attn_v,
+                &batch.norm_out, &batch.v, cfg.hidden_dim, model.kv_dim, b);
+        });
+
+        // RoPE + KV store
+        timed!(elem_us, |enc: &ComputeEncoder| {
+            dispatch_rope_batch(enc, model, batch, &batch.q,
+                model.head_dim, start_pos, cfg.n_heads, model.q_dim, b);
+            dispatch_rope_batch(enc, model, batch, &batch.k,
+                model.head_dim, start_pos, cfg.n_kv_heads, model.kv_dim, b);
+            dispatch_kv_store_batch(enc, batch, model.kv_dim, layer, start_pos, b);
+        });
+
+        // Attention
+        timed!(attn_us, |enc: &ComputeEncoder| {
+            dispatch_attention_batch(enc, model, batch, layer, start_pos, b);
+        });
+
+        // O projection
+        timed!(matmul_us, |enc: &ComputeEncoder| {
+            dispatch_matmul(enc, model, batch, lo.attn_output_type,
+                lo.attn_output, lo.fp16_attn_output,
+                &batch.attn_out, &batch.norm_out, model.q_dim, cfg.hidden_dim, b);
+        });
+
+        // Fused residual + rmsnorm
+        timed!(elem_us, |enc: &ComputeEncoder| {
+            dispatch_residual_rmsnorm(enc, batch, &batch.x, &batch.norm_out,
+                &model.weights, lo.ffn_norm, cfg.hidden_dim, b);
+        });
+
+        // Gate + Up matmuls
+        timed!(matmul_us, |enc: &ComputeEncoder| {
+            dispatch_matmul(enc, model, batch, lo.ffn_gate_type,
+                lo.ffn_gate, lo.fp16_ffn_gate,
+                &batch.norm_out, &batch.gate, cfg.hidden_dim, cfg.ffn_dim, b);
+            dispatch_matmul(enc, model, batch, lo.ffn_up_type,
+                lo.ffn_up, lo.fp16_ffn_up,
+                &batch.norm_out, &batch.up, cfg.hidden_dim, cfg.ffn_dim, b);
+        });
+
+        // SiLU
+        timed!(elem_us, |enc: &ComputeEncoder| {
+            dispatch_silu_batch(enc, batch, cfg.ffn_dim as u64 * b as u64);
+        });
+
+        // Down + residual
+        timed!(matmul_us, |enc: &ComputeEncoder| {
+            dispatch_matmul(enc, model, batch, lo.ffn_down_type,
+                lo.ffn_down, lo.fp16_ffn_down,
+                &batch.ffn_mid, &batch.norm_out, cfg.ffn_dim, cfg.hidden_dim, b);
+        });
+
+        timed!(elem_us, |enc: &ComputeEncoder| {
+            dispatch_residual_add(enc, batch, &batch.x, &batch.norm_out,
+                cfg.hidden_dim as u64 * b as u64);
+        });
+    }
+
+    // Final RMSNorm
+    timed!(elem_us, |enc: &ComputeEncoder| {
+        dispatch_rmsnorm_batch(enc, batch, &batch.x, &batch.norm_out,
+            &model.weights, model.out_norm_off, cfg.hidden_dim, b);
+    });
+
+    // Output projection
+    timed!(output_us, |enc: &ComputeEncoder| {
+        dispatch_matmul(enc, model, batch, model.output_type,
+            model.output_off, model.fp16_output_off,
+            &batch.norm_out, &batch.logits, cfg.hidden_dim, cfg.vocab_size, b);
+    });
+
+    // Argmax
+    timed!(elem_us, |enc: &ComputeEncoder| {
+        dispatch_argmax_batch(enc, batch, cfg.vocab_size, b);
+    });
+
+    let total = matmul_us + attn_us + elem_us + output_us;
+    (total / 1000.0, matmul_us / 1000.0, attn_us / 1000.0, elem_us / 1000.0, output_us / 1000.0)
 }
 
 // ── Dispatch helpers ──
@@ -316,19 +491,96 @@ fn dispatch_rmsnorm_batch(
     );
 }
 
-/// Hybrid matmul dispatch: routes Q4_0 to v3b, everything else to FP16 MMA.
+/// Smart matmul dispatch:
+/// - n=1: scalar matvec (bandwidth-optimal for single token, ~10x faster than MMA path)
+/// - n>1 Q4_0: grid-tiled v3b MMA (tile_b=80, batch via grid_y)
+/// - n>1 other: grid-tiled FP16 MMA (tile_b=80, pre-dequanted weights)
 fn dispatch_matmul(
     enc: &ComputeEncoder, model: &Model, batch: &BatchState,
     dtype: GGMLType, quant_off: u64, fp16_off: u64,
     x: &Buffer, y: &Buffer, cols: u32, rows: u32, b: u32,
 ) {
-    match dtype {
-        GGMLType::Q4_0 => dispatch_q4_0_mma(enc, model, batch, quant_off, x, y, cols, rows, b),
-        _ => dispatch_fp16_mma(enc, model, batch, fp16_off, x, y, cols, rows, b),
+    if b <= 1 {
+        dispatch_scalar_matvec(enc, model, batch, dtype, quant_off, x, y, cols, rows, b);
+    } else {
+        match dtype {
+            GGMLType::Q4_0 => dispatch_q4_0_grid(enc, model, batch, quant_off, x, y, cols, rows, b),
+            _ => dispatch_fp16_grid(enc, model, batch, fp16_off, x, y, cols, rows, b),
+        }
     }
 }
 
-/// v3b Q4_0 MMA: 128-thread TG, 4 SG, 32 rows per TG.
+/// Scalar FP16 matvec: for n=1, uses simd_sum scalar kernel.
+/// Reads quantized weights and half-precision X, produces half-precision Y.
+/// Grid: (ceil(rows/8), 1), TG: 256 = 8 SGs, 1 row per SG.
+fn dispatch_scalar_matvec(
+    enc: &ComputeEncoder, _model: &Model, batch: &BatchState,
+    dtype: GGMLType, quant_off: u64,
+    x: &Buffer, y: &Buffer, cols: u32, rows: u32, b: u32,
+) {
+    let pipe = match dtype {
+        GGMLType::Q4_0 => &batch.p_matvec_q4_0,
+        GGMLType::Q4_1 => &batch.p_matvec_q4_1,
+        GGMLType::Q6K => &batch.p_matvec_q6k,
+        _ => panic!("unsupported scalar matvec dtype: {:?}", dtype),
+    };
+    enc.set_pipeline(pipe);
+    enc.set_buffer(0, &_model.weights, quant_off);
+    enc.set_buffer(1, x, 0);
+    enc.set_buffer(2, y, 0);
+    enc.set_bytes(3, &cols as *const u32 as *const c_void, 4);
+    enc.set_bytes(4, &rows as *const u32 as *const c_void, 4);
+    enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+    let grid_x = (rows + 7) / 8; // 8 rows per TG (1 per SG, 8 SGs)
+    enc.dispatch_threadgroups(
+        MTLSize::new(grid_x as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+/// Grid-tiled v3b Q4_0 MMA: tile_b=80, batch via grid_y.
+/// Grid: (ceil(rows/32), ceil(b/80)), TG: 128. Supports any B up to MAX_BATCH.
+fn dispatch_q4_0_grid(
+    enc: &ComputeEncoder, model: &Model, batch: &BatchState,
+    quant_off: u64, x: &Buffer, y: &Buffer, cols: u32, rows: u32, b: u32,
+) {
+    enc.set_pipeline(&batch.p_q4_0_grid);
+    enc.set_buffer(0, &model.weights, quant_off);
+    enc.set_buffer(1, x, 0);
+    enc.set_buffer(2, y, 0);
+    enc.set_bytes(3, &cols as *const u32 as *const c_void, 4);
+    enc.set_bytes(4, &rows as *const u32 as *const c_void, 4);
+    enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+    let row_groups = ((rows + 31) / 32) as u64;
+    let batch_tiles = ((b as u64 + TILE_B as u64 - 1) / TILE_B as u64) as u64;
+    enc.dispatch_threadgroups(
+        MTLSize::new(row_groups, batch_tiles, 1),
+        MTLSize::new(128, 1, 1),
+    );
+}
+
+/// Grid-tiled FP16 MMA: tile_b=80, batch via grid_y.
+/// Grid: (ceil(rows/32), ceil(b/80)), TG: 128. Pre-dequanted FP16 weights.
+fn dispatch_fp16_grid(
+    enc: &ComputeEncoder, model: &Model, batch: &BatchState,
+    fp16_off: u64, x: &Buffer, y: &Buffer, cols: u32, rows: u32, b: u32,
+) {
+    enc.set_pipeline(&batch.p_fp16_grid);
+    enc.set_buffer(0, &model.fp16_buf, fp16_off);
+    enc.set_buffer(1, x, 0);
+    enc.set_buffer(2, y, 0);
+    enc.set_bytes(3, &cols as *const u32 as *const c_void, 4);
+    enc.set_bytes(4, &rows as *const u32 as *const c_void, 4);
+    enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+    let row_groups = ((rows + 31) / 32) as u64;
+    let batch_tiles = ((b as u64 + TILE_B as u64 - 1) / TILE_B as u64) as u64;
+    enc.dispatch_threadgroups(
+        MTLSize::new(row_groups, batch_tiles, 1),
+        MTLSize::new(128, 1, 1),
+    );
+}
+
+/// v3b Q4_0 MMA: 128-thread TG, 4 SG, 32 rows per TG (legacy, B=80 baked in).
 /// Reads quantized weights from model.weights. Dequant in simdgroup tile.
 fn dispatch_q4_0_mma(
     enc: &ComputeEncoder, model: &Model, batch: &BatchState,
@@ -365,6 +617,26 @@ fn dispatch_fp16_mma(
     enc.dispatch_threadgroups(
         MTLSize::new(grid_x as u64, 1, 1),
         MTLSize::new(256, 1, 1),
+    );
+}
+
+/// Pure FP16 MMA matmul: 128-thread TG, 4 SG, 32 rows per TG.
+/// Same as dispatch_fp16_mma but with smaller TG for better occupancy.
+fn dispatch_fp16_mma_128(
+    enc: &ComputeEncoder, model: &Model, batch: &BatchState,
+    fp16_off: u64, x: &Buffer, y: &Buffer, cols: u32, rows: u32, b: u32,
+) {
+    enc.set_pipeline(&batch.p_fp16_mma_128);
+    enc.set_buffer(0, &model.fp16_buf, fp16_off);
+    enc.set_buffer(1, x, 0);
+    enc.set_buffer(2, y, 0);
+    enc.set_bytes(3, &cols as *const u32 as *const c_void, 4);
+    enc.set_bytes(4, &rows as *const u32 as *const c_void, 4);
+    enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+    let grid_x = (rows + 31) / 32; // 32 rows per TG with 4 SG
+    enc.dispatch_threadgroups(
+        MTLSize::new(grid_x as u64, 1, 1),
+        MTLSize::new(128, 1, 1),
     );
 }
 

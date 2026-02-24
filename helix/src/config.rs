@@ -18,19 +18,58 @@ pub fn ensure_dir(dir: &Path) -> Result<(), String> {
 
 pub fn sanitize_topic(topic: &str) -> String {
     let bytes = topic.as_bytes();
+    let mut raw = String::with_capacity(bytes.len());
     if bytes.iter().all(|b| b.is_ascii()) {
-        let mut out = String::with_capacity(bytes.len());
         for &b in bytes {
-            out.push(if b.is_ascii_alphanumeric() || b == b'-' {
+            raw.push(if b.is_ascii_alphanumeric() || b == b'-' || b == b'/' {
                 b.to_ascii_lowercase() as char
             } else { '-' });
         }
-        out
     } else {
-        topic.to_lowercase().chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
-            .collect()
+        for c in topic.to_lowercase().chars() {
+            raw.push(if c.is_alphanumeric() || c == '-' || c == '/' { c } else { '-' });
+        }
     }
+    normalize_slashes(&raw)
+}
+
+/// Strip leading/trailing `/`, collapse `//` → `/`, strip trailing `-` per segment.
+fn normalize_slashes(s: &str) -> String {
+    let trimmed = s.trim_matches('/');
+    let mut out = String::with_capacity(trimmed.len());
+    let mut last_slash = false;
+    for c in trimmed.chars() {
+        if c == '/' {
+            // Trim trailing dashes from previous segment
+            while out.ends_with('-') { out.pop(); }
+            if !last_slash && !out.is_empty() { out.push('/'); }
+            last_slash = true;
+        } else {
+            // Skip leading dashes at start of segment
+            if last_slash && c == '-' && out.ends_with('/') { continue; }
+            out.push(c);
+            last_slash = false;
+        }
+    }
+    while out.ends_with('-') || out.ends_with('/') { out.pop(); }
+    out
+}
+
+/// Does `topic` match `query` in the hierarchy? Exact or prefix.
+/// "iris/xnu/regions" matches query "iris/xnu" and "iris" and "iris/xnu/regions".
+pub fn topic_matches_query(topic: &str, query: &str) -> bool {
+    topic == query || topic.starts_with(query) && topic.as_bytes().get(query.len()) == Some(&b'/')
+}
+
+/// Hierarchy distance: 0 for exact match, 1 for direct child, etc.
+/// Returns None if topic is not under query at all.
+pub fn hierarchy_distance(topic: &str, query: &str) -> Option<usize> {
+    if topic == query { return Some(0); }
+    if topic.starts_with(query) && topic.as_bytes().get(query.len()) == Some(&b'/') {
+        let suffix = &topic[query.len() + 1..];
+        return Some(1 + suffix.chars().filter(|&c| c == '/').count());
+    }
+    None
 }
 
 pub fn log_path(dir: &Path) -> PathBuf { dir.join("data.log") }

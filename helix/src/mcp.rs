@@ -678,24 +678,93 @@ fn dispatch_topics(args: Option<&Value>, dir: &Path) -> Result<String, String> {
             Ok("checkpoint cleared".into())
         }
         _ => {
-            // Default: list topics
+            // Default: list topics — hierarchical tree view
+            let prefix = opt(arg(args, "topic"));
             crate::cache::with_corpus(dir, |cached| {
                 let mut topics: std::collections::BTreeMap<&str, (usize, i32)> = std::collections::BTreeMap::new();
                 for e in cached {
+                    if let Some(p) = prefix {
+                        if !crate::config::topic_matches_query(e.topic.as_str(), p) { continue; }
+                    }
                     let (c, latest) = topics.entry(&e.topic).or_insert((0, 0));
                     *c += 1; if e.timestamp_min > *latest { *latest = e.timestamp_min; }
                 }
-                let mut sorted: Vec<_> = topics.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.1.cmp(&a.1.1));
-                let mut out = String::new();
-                for (topic, (count, latest)) in &sorted {
-                    let _ = writeln!(out, "  {topic} ({count}, {})", crate::time::minutes_to_date_str(*latest));
+                if topics.is_empty() {
+                    return if let Some(p) = prefix { format!("no topics under '{p}'\n") }
+                    else { "no topics\n".into() };
                 }
-                let _ = writeln!(out, "{} topics, {} entries", sorted.len(), cached.len());
-                out
+                format_topic_tree(&topics)
             })
         }
     }
+}
+
+/// Format topics as a hierarchical tree.
+/// Input: BTreeMap of "topic/path" → (count, latest_timestamp).
+/// Output: indented tree with rollup counts.
+fn format_topic_tree(topics: &std::collections::BTreeMap<&str, (usize, i32)>) -> String {
+    use std::fmt::Write;
+    let total_entries: usize = topics.values().map(|(c, _)| c).sum();
+
+    // Check if any topics use hierarchy
+    let has_hierarchy = topics.keys().any(|k| k.contains('/'));
+    if !has_hierarchy {
+        // Flat display (backward compat)
+        let mut sorted: Vec<_> = topics.iter().collect();
+        sorted.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        let mut out = String::new();
+        for (topic, (count, latest)) in &sorted {
+            let _ = writeln!(out, "  {topic} ({count}, {})", crate::time::minutes_to_date_str(*latest));
+        }
+        let _ = writeln!(out, "{} topics, {} entries", sorted.len(), total_entries);
+        return out;
+    }
+
+    // Build tree: collect subtree entry counts and latest timestamps per prefix
+    let mut prefixes: std::collections::BTreeMap<String, (usize, i32, usize)> = std::collections::BTreeMap::new();
+    for (&topic, &(count, latest)) in topics {
+        // Register each prefix level
+        let parts: Vec<&str> = topic.split('/').collect();
+        for depth in 1..parts.len() {
+            let prefix = parts[..depth].join("/");
+            let e = prefixes.entry(prefix).or_insert((0, 0, 0));
+            e.0 += count; // subtree entries
+            if latest > e.1 { e.1 = latest; } // subtree latest
+            e.2 += 1; // subtree topic count
+        }
+    }
+
+    // Sort topics: by top-level prefix, then alphabetically within
+    let mut sorted: Vec<_> = topics.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut out = String::new();
+    let mut last_top = String::new();
+    for (&topic, &(count, latest)) in &sorted {
+        let parts: Vec<&str> = topic.split('/').collect();
+        let top = parts[0];
+        // Print top-level group header if new
+        if top != last_top {
+            if !last_top.is_empty() { out.push('\n'); }
+            if let Some(&(sub_entries, sub_latest, sub_topics)) = prefixes.get(top) {
+                let _ = writeln!(out, "{}/ ({} entries, {} subtopics, {})",
+                    top, sub_entries, sub_topics, crate::time::minutes_to_date_str(sub_latest));
+            }
+            last_top = top.to_string();
+        }
+        // Print the topic with indentation matching depth
+        let depth = parts.len() - 1;
+        if depth == 0 {
+            // Top-level topic (no /)
+            let _ = writeln!(out, "  {topic} ({count}, {})", crate::time::minutes_to_date_str(latest));
+        } else {
+            let indent = "  ".repeat(depth);
+            let leaf = *parts.last().unwrap();
+            let _ = writeln!(out, "  {indent}{leaf} ({count}, {})", crate::time::minutes_to_date_str(latest));
+        }
+    }
+    let _ = writeln!(out, "\n{} topics, {} entries", sorted.len(), total_entries);
+    out
 }
 
 fn dispatch_trace(args: Option<&Value>) -> Result<String, String> {

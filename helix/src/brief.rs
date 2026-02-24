@@ -46,7 +46,7 @@ pub fn run(dir: &Path, query: &str, detail: &str, since_hours: Option<u64>,
         for e in cached {
             let topic = e.topic.as_str();
             if is_glob { if glob_match(&q, topic) { primary_set.insert(topic); } }
-            else if topic.contains(q_sanitized.as_str()) { primary_set.insert(topic); }
+            else if crate::config::topic_matches_query(topic, &q_sanitized) { primary_set.insert(topic); }
         }
 
         let mut entries: Vec<RawEntry> = Vec::new();
@@ -59,7 +59,13 @@ pub fn run(dir: &Path, query: &str, detail: &str, since_hours: Option<u64>,
             let days_old = e.days_old(now_days);
             if let Some(max) = max_days { if days_old > max { continue; } }
             matched.insert(e.offset);
-            let mut relevance = if is_primary { 10.0 } else { 0.0 };
+            let mut relevance = if is_primary {
+                // Hierarchy proximity: exact match = 10, child = 9, grandchild = 8, ...
+                match crate::config::hierarchy_distance(e.topic.as_str(), &q_sanitized) {
+                    Some(d) => (10.0 - d as f64).max(5.0),
+                    None => 10.0, // glob match or other primary
+                }
+            } else { 0.0 };
             for t in &q_terms { relevance += *e.tf_map.get(t).unwrap_or(&0) as f64; }
             if !e.has_tag("invariant") && !e.has_tag("architecture") {
                 relevance *= 1.0 + 1.0 / (1.0 + days_old as f64 / 7.0);

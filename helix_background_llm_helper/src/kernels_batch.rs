@@ -6,8 +6,8 @@
 //! Iteration 10: unconditional FMA, conditional writes only.
 
 /// Default batch size: 80 = 10 MMA groups × 8.
+/// Optimal for v3b on M3 Max. B=128/160 regress from register pressure.
 /// Compute ceiling at ~0.44ms/token (39% of M3 Max FP16 MMA peak).
-/// B=128 tested: same per-token time but worse attention cost.
 pub const BATCH_SIZE: u32 = 80;
 
 /// Padded batch size for MMA kernel (must be multiple of 8 for simdgroup_matrix).
@@ -17,7 +17,7 @@ pub const BATCH_PADDED: u32 = (BATCH_SIZE + 7) / 8 * 8; // 56
 /// Grid Y is always 1 — kernel handles full batch internally.
 pub const BATCH_NB: u32 = 1024;
 
-const HEADER: &str = r#"
+pub const HEADER_STR: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
@@ -384,15 +384,120 @@ pub fn gen_matmul_q4_0_f16_named(name: &str, n: u32) -> String {
     s
 }
 
+/// Generate named FP16 Q4_1 kernel variant.
+pub fn gen_matmul_q4_1_f16_named(name: &str, n: u32) -> String {
+    let mut s = String::with_capacity(4096);
+    s += &format!("kernel void {name}(\n");
+    s += "    device const uchar *W     [[buffer(0)]],\n";
+    s += "    device const half  *X     [[buffer(1)]],\n";
+    s += "    device half        *Y     [[buffer(2)]],\n";
+    s += "    constant uint      &cols  [[buffer(3)]],\n";
+    s += "    constant uint      &rows  [[buffer(4)]],\n";
+    s += "    constant uint      &batch [[buffer(5)]],\n";
+    s += "    uint3 tgid [[threadgroup_position_in_grid]],\n";
+    s += "    uint3 tid  [[thread_position_in_threadgroup]]\n";
+    s += ") {\n";
+    s += "    uint lid = tid.x;\n";
+    s += "    uint lane = lid % 32;\n";
+    s += "    uint sgid = lid / 32;\n";
+    s += "    uint row_base = tgid.x * 8;\n";
+    s += "    uint my_row = row_base + sgid;\n";
+    s += "    if (my_row >= rows) return;\n";
+    s += "    uint blocks_per_row = cols / 32;\n";
+    s += "    uint row_bytes = blocks_per_row * 20;\n";
+    s += "    device const uchar *wp = W + my_row * row_bytes;\n\n";
+    for i in 0..n {
+        s += &format!("    half s{i} = 0.0h;\n");
+    }
+    s += "\n    for (uint bi = 0; bi < blocks_per_row; bi++) {\n";
+    s += "        device const uchar *bp = wp + bi * 20;\n";
+    s += "        half d = *((device const half *)bp);\n";
+    s += "        half m = *((device const half *)(bp + 2));\n";
+    s += "        uchar qb = bp[4 + (lane & 15)];\n";
+    s += "        uint shift = (lane >> 4) * 4;\n";
+    s += "        half w = d * half(int(qb >> shift) & 0xF) + m;\n";
+    s += "        uint c = bi * 32 + lane;\n\n";
+    for i in 0..n {
+        s += &format!("        s{i} += w * X[{i}u * cols + c];\n");
+    }
+    s += "    }\n\n";
+    for i in 0..n {
+        s += &format!("    s{i} = simd_sum(s{i});\n");
+    }
+    s += "\n    if (lane == 0) {\n";
+    for i in 0..n {
+        s += &format!("        if ({i}u < batch) Y[{i}u * rows + my_row] = s{i};\n");
+    }
+    s += "    }\n";
+    s += "}\n\n";
+    s
+}
+
+/// Generate named FP16 Q6K kernel variant.
+pub fn gen_matmul_q6k_f16_named(name: &str, n: u32) -> String {
+    let mut s = String::with_capacity(4096);
+    s += &format!("kernel void {name}(\n");
+    s += "    device const uchar *W     [[buffer(0)]],\n";
+    s += "    device const half  *X     [[buffer(1)]],\n";
+    s += "    device half        *Y     [[buffer(2)]],\n";
+    s += "    constant uint      &cols  [[buffer(3)]],\n";
+    s += "    constant uint      &rows  [[buffer(4)]],\n";
+    s += "    constant uint      &batch [[buffer(5)]],\n";
+    s += "    uint3 tgid [[threadgroup_position_in_grid]],\n";
+    s += "    uint3 tid  [[thread_position_in_threadgroup]]\n";
+    s += ") {\n";
+    s += "    uint lid = tid.x;\n";
+    s += "    uint lane = lid % 32;\n";
+    s += "    uint sgid = lid / 32;\n";
+    s += "    uint row_base = tgid.x * 8;\n";
+    s += "    uint my_row = row_base + sgid;\n";
+    s += "    if (my_row >= rows) return;\n";
+    s += "    uint blocks_per_row = cols / 256;\n";
+    s += "    device const uchar *wp = W + my_row * blocks_per_row * 210;\n\n";
+    for i in 0..n {
+        s += &format!("    half s{i} = 0.0h;\n");
+    }
+    s += "\n    for (uint bi = 0; bi < blocks_per_row; bi++) {\n";
+    s += "        device const uchar *blk = wp + bi * 210;\n";
+    s += "        for (uint e = 0; e < 8; e++) {\n";
+    s += "            uint elem = e * 32 + lane;\n";
+    s += "            half w = half(q6k_dequant(blk, elem));\n";
+    s += "            uint c = bi * 256 + elem;\n";
+    for i in 0..n {
+        s += &format!("            s{i} += w * X[{i}u * cols + c];\n");
+    }
+    s += "        }\n";
+    s += "    }\n\n";
+    for i in 0..n {
+        s += &format!("    s{i} = simd_sum(s{i});\n");
+    }
+    s += "\n    if (lane == 0) {\n";
+    for i in 0..n {
+        s += &format!("        if ({i}u < batch) Y[{i}u * rows + my_row] = s{i};\n");
+    }
+    s += "    }\n";
+    s += "}\n\n";
+    s
+}
+
 /// Generate Q4_0 batch matmul v3b using simdgroup_matrix hardware MMA.
 /// Grid: (ceil(rows/32), 1), TG: 128 = 4 simdgroups, 32 rows per TG.
 /// Per-simdgroup tile staging with simdgroup_barrier (not threadgroup_barrier).
 /// Each simdgroup independently stages its 8 rows × 32 K elements into a local tile,
-/// then iterates 4 K steps loading B from the tile, 7 A loads + MMAs per step.
+/// then iterates 4 K steps loading B from the tile, N A loads + MMAs per step.
 /// Note: 256-thread variant tested and was 5.4% slower (worse TG occupancy).
+/// Note: K=64 tile tested and was 22% slower (doubled staging cost).
 pub fn gen_matmul_q4_0_mma() -> String {
+    gen_matmul_q4_0_mma_named("matmul_q4_0_mma", BATCH_SIZE)
+}
+
+/// Parameterized v3b MMA: generate with arbitrary batch size and kernel name.
+/// batch_size must be multiple of 8 (for simdgroup_matrix 8×8).
+pub fn gen_matmul_q4_0_mma_named(name: &str, batch_size: u32) -> String {
+    assert!(batch_size % 8 == 0, "batch_size must be multiple of 8");
+    let n_groups = batch_size / 8;
     let mut s = String::with_capacity(8192);
-    s += "kernel void matmul_q4_0_mma(\n";
+    s += &format!("kernel void {name}(\n");
     s += "    device const uchar *W     [[buffer(0)]],\n";
     s += "    device const half  *X     [[buffer(1)]],\n";
     s += "    device half        *Y     [[buffer(2)]],\n";
@@ -413,7 +518,6 @@ pub fn gen_matmul_q4_0_mma() -> String {
     s += "    threadgroup half tiles[4 * 32 * 9];\n";
     s += "    threadgroup half *tile = tiles + sgid * 32 * 9;\n";
     s += "\n";
-    let n_groups = BATCH_SIZE / 8;
     // Declare accumulators (4 per line for readability)
     for g in 0..n_groups {
         if g % 4 == 0 {
@@ -469,6 +573,163 @@ pub fn gen_matmul_q4_0_mma() -> String {
     s += "}\n\n";
     s
 }
+/// Tiled v3b MMA: processes batch in tiles of TILE_B (default 8).
+/// Accumulator pressure is CONSTANT (1 simdgroup_half8x8 per tile slot),
+/// regardless of total batch size. Weight tile staged once, reused across all batch tiles.
+/// Grid: (ceil(rows/32), 1), TG: 128 = 4 SG, 32 rows per TG.
+pub fn gen_matmul_q4_0_mma_tiled(name: &str, total_b: u32, tile_b: u32) -> String {
+    assert!(tile_b % 8 == 0 && total_b % tile_b == 0, "tile_b must divide total_b, both multiples of 8");
+    let accum_groups = tile_b / 8; // accumulators live at any time
+    let n_tiles = total_b / tile_b;
+    let mut s = String::with_capacity(16384);
+    s += &format!("kernel void {name}(\n");
+    s += "    device const uchar *W     [[buffer(0)]],\n";
+    s += "    device const half  *X     [[buffer(1)]],\n";
+    s += "    device half        *Y     [[buffer(2)]],\n";
+    s += "    constant uint      &cols  [[buffer(3)]],\n";
+    s += "    constant uint      &rows  [[buffer(4)]],\n";
+    s += "    constant uint      &batch [[buffer(5)]],\n";
+    s += "    uint3 tgid [[threadgroup_position_in_grid]],\n";
+    s += "    uint3 tid  [[thread_position_in_threadgroup]]\n";
+    s += ") {\n";
+    s += "    uint lid = tid.x;\n";
+    s += "    uint sgid = lid / 32;\n";
+    s += "    uint lane = lid % 32;\n";
+    s += "    uint row_base = tgid.x * 32;\n";
+    s += "    if (row_base >= rows) return;\n";
+    s += "\n";
+    s += "    threadgroup half tiles[4 * 32 * 9];\n";
+    s += "    threadgroup half *tile = tiles + sgid * 32 * 9;\n";
+    s += "    uint blocks_per_row = cols / 32;\n";
+    s += "    uint row_bytes = blocks_per_row * 18;\n";
+    s += "\n";
+    // Iterate over batch tiles
+    s += &format!("    for (uint bt = 0; bt < {n_tiles}; bt++) {{\n");
+    s += &format!("        uint b_off = bt * {tile_b};\n");
+    // Init accumulators for this tile
+    for g in 0..accum_groups {
+        s += &format!("        simdgroup_half8x8 C{g}(0.0h);\n");
+    }
+    s += "\n";
+    // Weight loop
+    s += "        for (uint bi = 0; bi < blocks_per_row; bi++) {\n";
+    // Stage weight tile (same as original v3b)
+    s += "            for (uint t = lane; t < 256; t += 32) {\n";
+    s += "                uint k = t >> 3;\n";
+    s += "                uint r = t & 7;\n";
+    s += "                uint global_row = row_base + sgid * 8 + r;\n";
+    s += "                half w = 0.0h;\n";
+    s += "                if (global_row < rows) {\n";
+    s += "                    device const uchar *bp = W + global_row * row_bytes + bi * 18;\n";
+    s += "                    half dd = *((device const half *)bp);\n";
+    s += "                    w = dd * (half(int(bp[2 + (k & 15)] >> ((k >> 4) * 4)) & 0xF) - 8.0h);\n";
+    s += "                }\n";
+    s += "                tile[k * 9 + r] = w;\n";
+    s += "            }\n";
+    s += "            simdgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "\n";
+    // 4 K steps
+    s += "            for (uint ks = 0; ks < 4; ks++) {\n";
+    s += "                simdgroup_half8x8 B;\n";
+    s += "                simdgroup_load(B, tile + ks * 8 * 9, 9);\n";
+    for g in 0..accum_groups {
+        let off = g * 8;
+        s += &format!("                {{ simdgroup_half8x8 A; simdgroup_load(A, X + (b_off + {off}u) * cols + bi * 32 + ks * 8, cols); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
+    }
+    s += "            }\n";
+    s += "            simdgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "        }\n";
+    s += "\n";
+    // Store this tile's results
+    for g in 0..accum_groups {
+        let off = g * 8;
+        s += &format!("        simdgroup_store(C{g}, Y + (b_off + {off}u) * rows + row_base + sgid * 8, ulong(rows));\n");
+    }
+    s += "    }\n"; // end batch tile loop
+    s += "}\n\n";
+    s
+}
+
+/// Grid-tiled v3b MMA: batch tiling via GPU grid_y, not serial loop.
+/// Each TG handles tile_b batch items for 32 rows. grid = (ceil(rows/32), ceil(B/tile_b)).
+/// Gives MORE threadgroups → better GPU occupancy for small matrices.
+/// tile_b accumulators per TG (must be multiple of 8, typically 80).
+pub fn gen_matmul_q4_0_mma_grid(name: &str, tile_b: u32) -> String {
+    assert!(tile_b % 8 == 0, "tile_b must be multiple of 8");
+    let n_groups = tile_b / 8;
+    let mut s = String::with_capacity(8192);
+    s += &format!("kernel void {name}(\n");
+    s += "    device const uchar *W     [[buffer(0)]],\n";
+    s += "    device const half  *X     [[buffer(1)]],\n";
+    s += "    device half        *Y     [[buffer(2)]],\n";
+    s += "    constant uint      &cols  [[buffer(3)]],\n";
+    s += "    constant uint      &rows  [[buffer(4)]],\n";
+    s += "    constant uint      &batch [[buffer(5)]],\n";
+    s += "    uint3 tgid [[threadgroup_position_in_grid]],\n";
+    s += "    uint3 tid  [[thread_position_in_threadgroup]]\n";
+    s += ") {\n";
+    s += "    uint lid = tid.x;\n";
+    s += "    uint sgid = lid / 32;\n";
+    s += "    uint lane = lid % 32;\n";
+    s += "    uint row_base = tgid.x * 32;\n";
+    s += "    if (row_base >= rows) return;\n";
+    s += &format!("    uint b_off = tgid.y * {tile_b}u;\n");
+    s += "\n";
+    s += "    threadgroup half tiles[4 * 32 * 9];\n";
+    s += "    threadgroup half *tile = tiles + sgid * 32 * 9;\n";
+    s += "\n";
+    for g in 0..n_groups {
+        if g % 4 == 0 {
+            let end = std::cmp::min(g + 4, n_groups);
+            s += "    simdgroup_half8x8 ";
+            for i in g..end {
+                if i > g { s += ", "; }
+                s += &format!("C{i}(0.0h)");
+            }
+            s += ";\n";
+        }
+    }
+    s += "\n";
+    s += "    uint blocks_per_row = cols / 32;\n";
+    s += "    uint row_bytes = blocks_per_row * 18;\n";
+    s += "\n";
+    s += "    for (uint bi = 0; bi < blocks_per_row; bi++) {\n";
+    // Stage weight tile (identical to original v3b)
+    s += "        for (uint t = lane; t < 256; t += 32) {\n";
+    s += "            uint k = t >> 3;\n";
+    s += "            uint r = t & 7;\n";
+    s += "            uint global_row = row_base + sgid * 8 + r;\n";
+    s += "            half w = 0.0h;\n";
+    s += "            if (global_row < rows) {\n";
+    s += "                device const uchar *bp = W + global_row * row_bytes + bi * 18;\n";
+    s += "                half dd = *((device const half *)bp);\n";
+    s += "                w = dd * (half(int(bp[2 + (k & 15)] >> ((k >> 4) * 4)) & 0xF) - 8.0h);\n";
+    s += "            }\n";
+    s += "            tile[k * 9 + r] = w;\n";
+    s += "        }\n";
+    s += "        simdgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "\n";
+    // MMA with batch offset
+    s += "        for (uint ks = 0; ks < 4; ks++) {\n";
+    s += "            simdgroup_half8x8 B;\n";
+    s += "            simdgroup_load(B, tile + ks * 8 * 9, 9);\n";
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("            {{ simdgroup_half8x8 A; simdgroup_load(A, X + (b_off + {off}u) * cols + bi * 32 + ks * 8, cols); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
+    }
+    s += "        }\n";
+    s += "        simdgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "    }\n";
+    s += "\n";
+    // Store with batch offset
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("    simdgroup_store(C{g}, Y + (b_off + {off}u) * rows + row_base + sgid * 8, ulong(rows));\n");
+    }
+    s += "}\n\n";
+    s
+}
+
 // ── Batch element-wise kernels (FP16) ──
 // Layout: column-major, X[batch_idx * dim + elem_idx].
 // All operate on half-precision data matching the FP16 matmul path.
@@ -798,15 +1059,24 @@ kernel void argmax_batch(
 "#;
 
 pub fn all_batch_kernels() -> String {
-    let mut s = HEADER.to_string();
+    let mut s = HEADER_STR.to_string();
     // Q4_0 MMA v3b: quantized dequant + simdgroup staging (bandwidth-optimal)
     s += &gen_matmul_q4_0_mma();
-    // FP16 scalar matmul (fallback for Q4_1/Q6K when MMA not available)
+    // FP16 scalar matmul for batch (fallback for Q4_1/Q6K)
     s += &gen_matmul_q4_0_f16(BATCH_SIZE);
     s += &gen_matmul_q4_1_f16(BATCH_SIZE);
     s += &gen_matmul_q6k_f16(BATCH_SIZE);
-    // Pure FP16 MMA matmul (for Q4_1/Q6K via pre-dequant, 256-thread TG)
-    s += &crate::kernels_fp16::gen_matmul_fp16_mma();
+    // n=1 scalar matvec for decode (single-token through batch path)
+    s += &gen_matmul_q4_0_f16_named("matvec_q4_0_f16", 1);
+    s += &gen_matmul_q4_1_f16_named("matvec_q4_1_f16", 1);
+    s += &gen_matmul_q6k_f16_named("matvec_q6k_f16", 1);
+    // Grid-tiled v3b: batch via grid_y, tile_b=80 (constant register pressure)
+    s += &gen_matmul_q4_0_mma_grid("matmul_q4_0_mma_grid", 80);
+    // Pure FP16 MMA matmul variants (pre-dequant weights, direct device loads)
+    s += &crate::kernels_fp16::gen_matmul_fp16_mma();     // 256-thread, 64 rows/TG
+    s += &crate::kernels_fp16::gen_matmul_fp16_mma_128(); // 128-thread, 32 rows/TG
+    // Grid-tiled FP16 MMA: batch via grid_y, tile_b=80
+    s += &crate::kernels_fp16::gen_matmul_fp16_mma_grid("matmul_fp16_mma_grid", 80);
     // Batch element-wise kernels
     s += crate::kernels_fp16::EMBED_FP16;
     s += EMBED_BATCH_Q4_0;

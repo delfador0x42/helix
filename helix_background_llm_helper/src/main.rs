@@ -18,6 +18,7 @@ mod bench_kernels;
 mod kernels_batch;
 mod kernels_fp16;
 mod infer_batch;
+mod bench_matmul;
 
 use std::path::{Path, PathBuf};
 
@@ -33,7 +34,9 @@ fn main() {
         "generate" => run_generate(args.get(2)),
         "bench-dispatch" => bench_dispatch::run(),
         "bench-kernels" => bench_kernels::run(),
+        "bench-matmul" => bench_matmul::run(),
         "bench-batch" => run_bench_batch(args.get(2)),
+        "bench-profile" => run_bench_profile(args.get(2)),
         "generate-batch" => run_generate_batch(args.get(2)),
         _ => usage(),
     }
@@ -359,9 +362,10 @@ fn run_bench_batch(path_arg: Option<&String>) {
     let gguf = gguf::GGUFFile::open(&path).unwrap_or_else(|e| fatal(&e));
     let mdl = model::Model::load(&gguf).unwrap_or_else(|e| fatal(&e));
     let batch = infer_batch::BatchState::new(&mdl).unwrap_or_else(|e| fatal(&e));
-    let bs = batch.batch_size;
+    // Use B=640 for benchmark: optimal throughput without KV cache overflow
+    let bs: u32 = 640;
 
-    eprintln!("\n=== Batch Forward Benchmark (B={}, FP16) ===\n", bs);
+    eprintln!("\n=== Batch Forward Benchmark (B={}, FP16 grid-tiled) ===\n", bs);
 
     let bos = gguf.config.bos_token;
     let tokens: Vec<u32> = vec![bos; bs as usize];
@@ -373,16 +377,7 @@ fn run_bench_batch(path_arg: Option<&String>) {
 
     let iters = 20u32;
 
-    // Benchmark: advancing positions (realistic — attention grows)
-    let t0 = std::time::Instant::now();
-    for i in 0..iters {
-        infer_batch::forward_batch(&mdl, &batch, &tokens, i * bs);
-    }
-    let per_iter = t0.elapsed().as_secs_f64() / iters as f64;
-    let tok_per_sec = bs as f64 / per_iter;
-    eprintln!("  Batch (advancing pos): {:.2}ms = {:.0} tok/s", per_iter * 1000.0, tok_per_sec);
-
-    // Benchmark: fixed pos=0 (isolates element-wise overhead)
+    // Benchmark: fixed pos=0 (pure prefill throughput, no attention growth)
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
         infer_batch::forward_batch(&mdl, &batch, &tokens, 0);
@@ -391,25 +386,126 @@ fn run_bench_batch(path_arg: Option<&String>) {
     let fixed_tps = bs as f64 / fixed_per;
     eprintln!("  Batch (pos=0 fixed):   {:.2}ms = {:.0} tok/s", fixed_per * 1000.0, fixed_tps);
 
+    // Benchmark: advancing positions (realistic — attention grows, limited to KV cache)
+    let max_pos_iters = std::cmp::min(iters, (2048 - bs) / bs);
+    if max_pos_iters > 0 {
+        let t0 = std::time::Instant::now();
+        for i in 0..max_pos_iters {
+            infer_batch::forward_batch(&mdl, &batch, &tokens, i * bs);
+        }
+        let per_iter = t0.elapsed().as_secs_f64() / max_pos_iters as f64;
+        let tok_per_sec = bs as f64 / per_iter;
+        eprintln!("  Batch (advancing pos): {:.2}ms = {:.0} tok/s ({max_pos_iters} iters)", per_iter * 1000.0, tok_per_sec);
+    }
+
     // Single-token comparison
     for _ in 0..3 { infer::forward(&mdl, bos, 0); }
     let t0 = std::time::Instant::now();
     for i in 0..iters { infer::forward(&mdl, bos, i); }
     let single_per = t0.elapsed().as_secs_f64() / iters as f64;
     eprintln!("  Single-token:          {:.2}ms = {:.0} tok/s", single_per * 1000.0, 1.0 / single_per);
-    eprintln!("  Batch speedup: {:.1}x", tok_per_sec * single_per);
+    eprintln!("  Batch speedup: {:.1}x", fixed_tps * single_per);
 
     // Correctness check: compare batch[0] vs single-token at pos=0
     eprintln!("\n  --- Correctness check (pos=0) ---");
     infer::forward(&mdl, bos, 0);
     let single_argmax = infer::argmax(&mdl);
     infer_batch::forward_batch(&mdl, &batch, &tokens, 0);
-    let batch_results = infer_batch::argmax_batch(&batch);
+    let batch_results = infer_batch::argmax_batch(&batch, bs);
     if single_argmax == batch_results[0] {
         eprintln!("  MATCH: single={}, batch[0]={}", single_argmax, batch_results[0]);
     } else {
         eprintln!("  MISMATCH: single={}, batch[0]={}", single_argmax, batch_results[0]);
     }
+
+    eprintln!("\n=== Done ===");
+}
+
+fn run_bench_profile(path_arg: Option<&String>) {
+    let path = path_arg.map(|s| std::path::PathBuf::from(s)).unwrap_or_else(|| {
+        let mut p = std::env::current_dir().unwrap_or_default();
+        p.push("models");
+        if let Ok(entries) = std::fs::read_dir(&p) {
+            for e in entries.flatten() {
+                if e.path().extension().map(|x| x == "gguf").unwrap_or(false) {
+                    return e.path();
+                }
+            }
+        }
+        eprintln!("No .gguf file found. Pass path as argument.");
+        std::process::exit(1);
+    });
+    eprintln!("Loading GGUF: {}", path.display());
+    let gguf = gguf::GGUFFile::open(&path).unwrap_or_else(|e| fatal(&e));
+    let mdl = model::Model::load(&gguf).unwrap_or_else(|e| fatal(&e));
+    let batch = infer_batch::BatchState::new(&mdl).unwrap_or_else(|e| fatal(&e));
+    let bs: u32 = 640; // optimal for profiling
+    let bos = gguf.config.bos_token;
+    let tokens: Vec<u32> = vec![bos; bs as usize];
+
+    eprintln!("\n=== Per-Operation GPU Profiling (B={}, pos=0) ===\n", bs);
+
+    // Warmup
+    for _ in 0..3 {
+        infer_batch::forward_batch(&mdl, &batch, &tokens, 0);
+    }
+
+    // Profile at pos=0 (minimal attention)
+    let iters = 5;
+    let mut t_total = 0.0; let mut t_mm = 0.0; let mut t_attn = 0.0;
+    let mut t_elem = 0.0; let mut t_out = 0.0;
+    for _ in 0..iters {
+        let (total, mm, attn, elem, out) =
+            infer_batch::forward_profiled(&mdl, &batch, &tokens, 0, bs);
+        t_total += total; t_mm += mm; t_attn += attn; t_elem += elem; t_out += out;
+    }
+    let d = iters as f64;
+    t_total /= d; t_mm /= d; t_attn /= d; t_elem /= d; t_out /= d;
+
+    let tps = bs as f64 / (t_total / 1000.0);
+    eprintln!("  Total:       {:.2}ms = {:.0} tok/s (serialized, overcounts due to cmd buf overhead)", t_total, tps);
+    eprintln!("  Matmul:      {:.2}ms ({:.1}%)", t_mm, t_mm / t_total * 100.0);
+    eprintln!("  Attention:   {:.2}ms ({:.1}%)", t_attn, t_attn / t_total * 100.0);
+    eprintln!("  Element-wise:{:.2}ms ({:.1}%)", t_elem, t_elem / t_total * 100.0);
+    eprintln!("  Output proj: {:.2}ms ({:.1}%)", t_out, t_out / t_total * 100.0);
+
+    // Compare with non-profiled (single cmd buf)
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        infer_batch::forward_batch(&mdl, &batch, &tokens, 0);
+    }
+    let real = t0.elapsed().as_secs_f64() / iters as f64 * 1000.0;
+    let real_tps = bs as f64 / (real / 1000.0);
+    eprintln!("\n  Non-profiled: {:.2}ms = {:.0} tok/s", real, real_tps);
+    eprintln!("  Profiling overhead: {:.2}ms ({:.1}x)", t_total - real, t_total / real);
+
+    // Also profile at pos=200 (heavier attention)
+    eprintln!("\n=== Profiling at pos=200 ===\n");
+    // Fill KV cache to pos=200
+    for i in 0..3 { infer_batch::forward_batch(&mdl, &batch, &tokens, i * bs); }
+
+    t_total = 0.0; t_mm = 0.0; t_attn = 0.0; t_elem = 0.0; t_out = 0.0;
+    for _ in 0..iters {
+        let (total, mm, attn, elem, out) =
+            infer_batch::forward_profiled(&mdl, &batch, &tokens, 200, bs);
+        t_total += total; t_mm += mm; t_attn += attn; t_elem += elem; t_out += out;
+    }
+    t_total /= d; t_mm /= d; t_attn /= d; t_elem /= d; t_out /= d;
+    let tps200 = bs as f64 / (t_total / 1000.0);
+    eprintln!("  Total:       {:.2}ms = {:.0} tok/s", t_total, tps200);
+    eprintln!("  Matmul:      {:.2}ms ({:.1}%)", t_mm, t_mm / t_total * 100.0);
+    eprintln!("  Attention:   {:.2}ms ({:.1}%)", t_attn, t_attn / t_total * 100.0);
+    eprintln!("  Element-wise:{:.2}ms ({:.1}%)", t_elem, t_elem / t_total * 100.0);
+    eprintln!("  Output proj: {:.2}ms ({:.1}%)", t_out, t_out / t_total * 100.0);
+
+    eprintln!("\n=== FLOP Analysis ===\n");
+    let flop_per_token = 2.474e9_f64;
+    let total_flop = flop_per_token * bs as f64;
+    let achieved_tflops = total_flop / (real / 1000.0) / 1e12;
+    eprintln!("  {:.2} GFLOP per token × {} tokens = {:.2} GFLOP per batch",
+        flop_per_token / 1e9, bs, total_flop / 1e9);
+    eprintln!("  At {:.2}ms: {:.2} TFLOP/s effective ({:.1}% of 14.2 TFLOP/s FP16 peak)",
+        real, achieved_tflops, achieved_tflops / 14.2 * 100.0);
 
     eprintln!("\n=== Done ===");
 }

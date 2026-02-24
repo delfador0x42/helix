@@ -94,13 +94,14 @@ kernel void dequant_q6k(
 "#;
 
 /// Pure FP16 MMA matmul: Y = W @ X, all FP16, direct device memory loads.
-/// 256-thread TG = 8 simdgroups, 64 rows per TG.
 /// Uses simdgroup_load transpose flag for weight matrix.
 /// N batch groups of 8 = BATCH_SIZE items.
-pub fn gen_matmul_fp16_mma() -> String {
+/// Parameterized by n_sg: 4 SG = 128 threads (32 rows), 8 SG = 256 threads (64 rows).
+fn gen_matmul_fp16_mma_impl(name: &str, n_sg: u32) -> String {
     let n_groups = crate::kernels_batch::BATCH_SIZE / 8;
+    let rows_per_tg = n_sg * 8;
     let mut s = String::with_capacity(4096);
-    s += "kernel void matmul_fp16_mma(\n";
+    s += &format!("kernel void {name}(\n");
     s += "    device const half *W     [[buffer(0)]],\n";
     s += "    device const half *X     [[buffer(1)]],\n";
     s += "    device half       *Y     [[buffer(2)]],\n";
@@ -112,7 +113,7 @@ pub fn gen_matmul_fp16_mma() -> String {
     s += ") {\n";
     s += "    uint lid = tid.x;\n";
     s += "    uint sgid = lid / 32;\n";
-    s += "    uint row_base = tgid.x * 64 + sgid * 8;\n";
+    s += &format!("    uint row_base = tgid.x * {rows_per_tg} + sgid * 8;\n");
     s += "    if (row_base >= rows) return;\n";
     s += "\n";
     for g in 0..n_groups {
@@ -140,6 +141,69 @@ pub fn gen_matmul_fp16_mma() -> String {
     for g in 0..n_groups {
         let off = g * 8;
         s += &format!("    simdgroup_store(C{g}, Y + {off}u*rows + row_base, ulong(rows));\n");
+    }
+    s += "}\n\n";
+    s
+}
+
+/// 256-thread FP16 MMA: 8 SG, 64 rows per TG. Original variant.
+pub fn gen_matmul_fp16_mma() -> String {
+    gen_matmul_fp16_mma_impl("matmul_fp16_mma", 8)
+}
+
+/// 128-thread FP16 MMA: 4 SG, 32 rows per TG. Better occupancy.
+pub fn gen_matmul_fp16_mma_128() -> String {
+    gen_matmul_fp16_mma_impl("matmul_fp16_mma_128", 4)
+}
+
+/// Grid-tiled FP16 MMA: batch via grid_y, constant register pressure.
+/// Grid: (ceil(rows/32), ceil(B/tile_b)), TG: 128 = 4 SG, 32 rows per TG.
+/// Each TG handles tile_b batch items for its 32 rows.
+pub fn gen_matmul_fp16_mma_grid(name: &str, tile_b: u32) -> String {
+    assert!(tile_b % 8 == 0, "tile_b must be multiple of 8");
+    let n_groups = tile_b / 8;
+    let mut s = String::with_capacity(4096);
+    s += &format!("kernel void {name}(\n");
+    s += "    device const half *W     [[buffer(0)]],\n";
+    s += "    device const half *X     [[buffer(1)]],\n";
+    s += "    device half       *Y     [[buffer(2)]],\n";
+    s += "    constant uint     &cols  [[buffer(3)]],\n";
+    s += "    constant uint     &rows  [[buffer(4)]],\n";
+    s += "    constant uint     &batch [[buffer(5)]],\n";
+    s += "    uint3 tgid [[threadgroup_position_in_grid]],\n";
+    s += "    uint3 tid  [[thread_position_in_threadgroup]]\n";
+    s += ") {\n";
+    s += "    uint lid = tid.x;\n";
+    s += "    uint sgid = lid / 32;\n";
+    s += "    uint row_base = tgid.x * 32 + sgid * 8;\n";
+    s += "    if (row_base >= rows) return;\n";
+    s += &format!("    uint b_off = tgid.y * {tile_b}u;\n");
+    s += "\n";
+    for g in 0..n_groups {
+        if g % 4 == 0 {
+            let end = std::cmp::min(g + 4, n_groups);
+            s += "    simdgroup_half8x8 ";
+            for i in g..end {
+                if i > g { s += ", "; }
+                s += &format!("C{i}(0.0h)");
+            }
+            s += ";\n";
+        }
+    }
+    s += "\n";
+    s += "    for (uint k = 0; k < cols; k += 8) {\n";
+    s += "        simdgroup_half8x8 B;\n";
+    s += "        simdgroup_load(B, W + row_base * cols + k, cols, ulong2(0,0), true);\n";
+    s += "\n";
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("        {{ simdgroup_half8x8 A; simdgroup_load(A, X + (b_off + {off}u)*cols + k, cols); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
+    }
+    s += "    }\n";
+    s += "\n";
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("    simdgroup_store(C{g}, Y + (b_off + {off}u)*rows + row_base, ulong(rows));\n");
     }
     s += "}\n\n";
     s
