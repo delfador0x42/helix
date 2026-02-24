@@ -54,6 +54,7 @@ cached_sel!(sel_setBytes, "setBytes:length:atIndex:");
 cached_sel!(sel_dispatchThreadgroups, "dispatchThreadgroups:threadsPerThreadgroup:");
 cached_sel!(sel_dispatchThreads, "dispatchThreads:threadsPerThreadgroup:");
 cached_sel!(sel_endEncoding, "endEncoding");
+cached_sel!(sel_memoryBarrier, "memoryBarrierWithScope:");
 cached_sel!(sel_commit, "commit");
 cached_sel!(sel_waitUntilCompleted, "waitUntilCompleted");
 cached_sel!(sel_commandBuffer, "commandBuffer");
@@ -143,6 +144,12 @@ unsafe fn msg_void(obj: Id, sel: Sel) {
     let f: unsafe extern "C" fn(Id, Sel) =
         std::mem::transmute(objc_msgSend as *const ());
     f(obj, sel)
+}
+
+unsafe fn msg_void_u64(obj: Id, sel: Sel, a1: u64) {
+    let f: unsafe extern "C" fn(Id, Sel, u64) =
+        std::mem::transmute(objc_msgSend as *const ());
+    f(obj, sel, a1)
 }
 
 unsafe fn msg_void_id(obj: Id, sel: Sel, a1: Id) {
@@ -426,6 +433,12 @@ impl ComputeEncoder {
 
     pub fn dispatch_threads(&self, grid: MTLSize, threadgroup: MTLSize) {
         unsafe { msg_void_2size(self.0, sel_dispatchThreads(), grid, threadgroup); }
+    }
+
+    /// Memory barrier for buffer writes. Ensures dequant writes are visible to subsequent MMA reads.
+    /// MTLBarrierScopeBuffers = 1.
+    pub fn memory_barrier_buffers(&self) {
+        unsafe { msg_void_u64(self.0, sel_memoryBarrier(), 1u64); }
     }
 
     pub fn end_encoding(&self) {
