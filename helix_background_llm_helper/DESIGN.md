@@ -34,6 +34,36 @@ Separate binary keeps helix core at zero deps (~5K lines). helix-bg has ort (ONN
 - `similarity.rs` — cosine distance, top-k pairs, centroids
 - `insight.rs` — topic overlap, duplicate, cross-link detection
 
+## GPU Inference Engine (70B Llama)
+
+Zero-dep Metal GPU inference for Llama 70B. No frameworks, no libraries — raw `objc_msgSend` FFI to Metal, GGUF mmap, quantized matmul kernels.
+
+### Performance (Llama-3.3-70B-Instruct Q5_K_L, Apple M3 Max 128GB)
+
+| Batch | tok/s | TFLOP/s | % of FP16 peak | Kernel |
+|-------|-------|---------|-----------------|--------|
+| B=80  | 58    | 8.13    | 57.2%           | matmul2d coop |
+| B=160 | **67**| **9.22**| **65.0%**       | matmul2d coop |
+| B=320 | 67    | 9.28    | 65.4%           | matmul2d coop |
+| B=640 | 64    | 8.87    | 62.5%           | matmul2d coop |
+| B=1024| 59    | 8.23    | 57.9%           | matmul2d coop |
+
+**67 tok/s at B=160-320** with verified correct output (coherent 70B chat). ~15% faster than simdgroup MMA baseline (58 tok/s). Generation speed: 5.9 tok/s (B=1, bandwidth-bound).
+
+### How It Works
+- **Metal 4 cooperative tensors**: `matmul2d` with `execution_simdgroups<4>`, TILE_K=256 (full Q5K block)
+- **Column-major tensor convention**: Apple MPP uses dim0=inner/fast, dim1=outer. X[K,M] strides {1,icols}, W[K,N], Y[N,M] strides {1,irows}
+- **Hoisted-scale dequant**: 128 threads, 32 rows × 4 threads/row, each thread handles one Q5K pair (64 elements)
+- **tensor_inline trick**: constructs `tensor<device half, dextents<int,2>, tensor_inline>` from raw pointers — uses classic `MTLComputeCommandEncoder` + `setBuffer`, no MTL4 encoder needed
+- **Fused residual+rmsnorm**: eliminates one data pass per layer
+- Q5K (480 tensors, 40.4GB) + Q6K (80 tensors, 8.0GB) + Q8_0 (2 tensors, 2.2GB) = 50.6GB
+
+### Key Files
+- `gpu.rs` — Metal device/buffer/encoder/pipeline FFI (objc_msgSend)
+- `model.rs` — GGUF weight loading, GPU buffer upload
+- `kernels_batch.rs` — all Metal shader source generation (Q5K/Q6K/Q8_0 matmul, attention, element-wise, Metal 4 cooperative tensor kernels)
+- `infer_batch.rs` — batch forward pass orchestration, pipeline dispatch, profiling
+
 ## Model Files (download once)
 - `~/.helix/models/model.onnx` — all-MiniLM-L6-v2 (~90MB)
 - `~/.helix/models/vocab.txt` — WordPiece vocabulary (30522 tokens, ~232KB)

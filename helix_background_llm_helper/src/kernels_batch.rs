@@ -1359,7 +1359,11 @@ pub fn gen_matmul_q5k_coop(name: &str, tile_m: u32, tile_n: u32, residual_add: b
     s += "    threadgroup half w_tile[TILE_N * TILE_K];\n";
     s += "\n";
 
-    // matmul2d: C[TILE_M × TILE_N] = X[TILE_M × TILE_K] × W^T[TILE_K × TILE_N]
+    // Column-major tensor convention: dim0 = inner (contiguous), dim1 = outer
+    // NT matmul: C[N,M] = A[K,M] × B[K,N]^T where M=batch, N=rows, K=cols
+    // A (X): extent(0)=K, extent(1)=M, strides={1, icols}
+    // B (W): extent(0)=K, extent(1)=N, strides={1, TILE_K} (default for static)
+    // C (Y): extent(0)=N, extent(1)=M, strides={1, irows}
     s += "    constexpr auto desc = matmul2d_descriptor(\n";
     s += "        TILE_M, TILE_N, TILE_K,\n";
     s += "        false, true,\n";
@@ -1368,18 +1372,23 @@ pub fn gen_matmul_q5k_coop(name: &str, tile_m: u32, tile_n: u32, residual_add: b
     s += "    matmul2d<desc, execution_simdgroups<4>> matmulOp;\n";
     s += "\n";
 
+    // x_tensor_t: column-major device tensor with dynamic extents + inline strides
+    // w_tensor_t: column-major threadgroup tensor [K, N] with default strides {1, K}
     s += "    using x_tensor_t = tensor<device half, dextents<int, 2>, tensor_inline>;\n";
-    s += "    using w_tensor_t = tensor<threadgroup half, extents<int, TILE_N, TILE_K>, tensor_inline>;\n";
+    s += "    using w_tensor_t = tensor<threadgroup half, extents<int, TILE_K, TILE_N>, tensor_inline>;\n";
     s += "\n";
 
     // Create cooperative tensor accumulator
     s += "    auto cT = matmulOp.get_destination_cooperative_tensor<x_tensor_t, w_tensor_t, half>();\n";
 
     if residual_add {
+        // Load existing Y values into accumulator (for += mode)
         s += "    {\n";
-        s += "        array<int, 2> y_str = {irows, 1};\n";
+        s += "        array<int, 2> y_str = {1, irows};\n";
+        s += "        int m_ext = min(TILE_M, ibatch - b_off);\n";
+        s += "        int n_ext = min(TILE_N, irows - row_base);\n";
         s += "        x_tensor_t yT(Y + b_off * irows + row_base,\n";
-        s += "            dextents<int, 2>(min(TILE_M, ibatch - b_off), min(TILE_N, irows - row_base)), y_str);\n";
+        s += "            dextents<int, 2>(n_ext, m_ext), y_str);\n";
         s += "        cT.load(yT);\n";
         s += "    }\n";
     } else {
@@ -1393,11 +1402,9 @@ pub fn gen_matmul_q5k_coop(name: &str, tile_m: u32, tile_n: u32, residual_add: b
     s += "    int row_bytes = blocks_per_row * 176;\n";
     s += "\n";
 
-    // Optimized dequant: each thread owns a row slice, hoists d/dmin per block,
-    // hoists sc/mn per sub-block. 128 threads across 32 rows × 256 K elements.
-    // Each thread handles 32*256/128 = 64 elements (2 rows × 32 elems, or similar)
-    s += "    int my_row_in_tile = lid / 4;   // 0..31 — 4 threads per row\n";
-    s += "    int my_lane = lid % 4;           // 0..3 — which 64-element chunk\n";
+    // Optimized dequant: 128 threads across 32 rows × 4 threads/row
+    s += "    int my_row_in_tile = lid / 4;\n";
+    s += "    int my_lane = lid % 4;\n";
     s += "    int global_row = row_base + my_row_in_tile;\n";
     s += "    bool valid = global_row < irows;\n";
     s += "\n";
@@ -1439,10 +1446,13 @@ pub fn gen_matmul_q5k_coop(name: &str, tile_m: u32, tile_n: u32, residual_add: b
     s += "\n";
 
     // Create tensor views and run matmul2d
-    s += "        array<int, 2> x_str = {icols, 1};\n";
+    // X[K,M]: dim0=K (contiguous stride 1), dim1=M (stride icols)
+    s += "        array<int, 2> x_str = {1, icols};\n";
+    s += "        int m_ext = min(TILE_M, ibatch - b_off);\n";
     s += "        x_tensor_t xT(X + b_off * icols + bi * 256,\n";
-    s += "            dextents<int, 2>(min(TILE_M, ibatch - b_off), TILE_K), x_str);\n";
-    s += "        w_tensor_t wT(&w_tile[0], extents<int, TILE_N, TILE_K>());\n";
+    s += "            dextents<int, 2>(TILE_K, m_ext), x_str);\n";
+    // W[K,N]: dim0=K (contiguous stride 1), dim1=N (stride TILE_K=256)
+    s += "        w_tensor_t wT(&w_tile[0], extents<int, TILE_K, TILE_N>());\n";
     s += "\n";
     s += "        matmulOp.run(xT, wT, cT);\n";
     s += "\n";
@@ -1450,11 +1460,13 @@ pub fn gen_matmul_q5k_coop(name: &str, tile_m: u32, tile_n: u32, residual_add: b
     s += "    }\n";
     s += "\n";
 
-    // Store result
+    // Store result: Y[N,M] with strides {1, irows}
     s += "    {\n";
-    s += "        array<int, 2> y_str = {irows, 1};\n";
+    s += "        array<int, 2> y_str = {1, irows};\n";
+    s += "        int m_ext2 = min(TILE_M, ibatch - b_off);\n";
+    s += "        int n_ext2 = min(TILE_N, irows - row_base);\n";
     s += "        x_tensor_t yT(Y + b_off * irows + row_base,\n";
-    s += "            dextents<int, 2>(min(TILE_M, ibatch - b_off), min(TILE_N, irows - row_base)), y_str);\n";
+    s += "            dextents<int, 2>(n_ext2, m_ext2), y_str);\n";
     s += "        cT.store(yT);\n";
     s += "    }\n";
     s += "}\n\n";

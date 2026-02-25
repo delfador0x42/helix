@@ -446,6 +446,7 @@ fn dispatch_matmul(
 ) {
     if b <= 1 {
         dispatch_matvec(enc, model, batch, dtype, quant_off, x, y, cols, rows);
+    // Metal 4 coop kernel (compiled with Metal 4.0 language version)
     } else if dtype == GGMLType::Q5K && batch.p_q5k_coop.is_some() {
         dispatch_mma_coop(enc, model, batch.p_q5k_coop.as_ref().unwrap(),
             quant_off, x, y, cols, rows, b);

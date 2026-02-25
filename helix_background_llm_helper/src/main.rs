@@ -36,6 +36,8 @@ fn main() {
         "bench-batch" => run_bench_batch(args.get(2)),
         "bench-profile" => run_bench_profile(args.get(2)),
         "generate-batch" => run_generate_batch(args.get(2)),
+        "dump-vocab" => dump_vocab(args.get(2)),
+        "chat" => run_chat(args.get(2), args.get(3).map(|s| s.as_str())),
         _ => usage(),
     }
 }
@@ -462,6 +464,258 @@ fn run_generate_batch(path_arg: Option<&String>) {
     eprintln!("\n  Generated text:\n{text}");
 
     eprintln!("\n=== Done ===");
+}
+
+fn dump_vocab(path_arg: Option<&String>) {
+    let path = path_arg.map(|s| std::path::PathBuf::from(s)).unwrap_or_else(|| {
+        let mut p = std::env::current_dir().unwrap_or_default();
+        p.push("models");
+        if let Ok(entries) = std::fs::read_dir(&p) {
+            for e in entries.flatten() {
+                if e.path().extension().map(|x| x == "gguf").unwrap_or(false) {
+                    return e.path();
+                }
+            }
+        }
+        eprintln!("No .gguf file found."); std::process::exit(1);
+    });
+    let gguf = gguf::GGUFFile::open(&path).unwrap_or_else(|e| fatal(&e));
+
+    // Dump tokenizer metadata keys
+    eprintln!("\n--- Tokenizer metadata keys ---");
+    for (k, v) in &gguf.metadata {
+        if k.contains("tokenizer") {
+            let desc = match v {
+                gguf::MetaValue::Str(s) => format!("str: {}", &s[..s.len().min(80)]),
+                gguf::MetaValue::U32(n) => format!("u32: {n}"),
+                gguf::MetaValue::Array(a) => format!("array[{}]", a.len()),
+                _ => format!("{:?}", v),
+            };
+            eprintln!("  {k}: {desc}");
+        }
+    }
+
+    // Dump first 260 vocab entries + special tokens at end
+    let vocab: Vec<String> = gguf.metadata.get("tokenizer.ggml.tokens")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| {
+            if let gguf::MetaValue::Str(s) = v { Some(s.clone()) } else { None }
+        }).collect())
+        .unwrap_or_default();
+
+    eprintln!("\n--- Vocab (first 260 / last 300) total={} ---", vocab.len());
+    for (i, t) in vocab.iter().enumerate().take(260) {
+        eprintln!("  {:>6}: {:?}", i, t);
+    }
+    if vocab.len() > 127900 {
+        eprintln!("\n  ... (skipping middle) ...\n");
+        for (i, t) in vocab.iter().enumerate().skip(vocab.len() - 300) {
+            eprintln!("  {:>6}: {:?}", i, t);
+        }
+    }
+
+    // Dump merges count
+    if let Some(gguf::MetaValue::Array(merges)) = gguf.metadata.get("tokenizer.ggml.merges") {
+        eprintln!("\n--- Merges: {} total ---", merges.len());
+        for (i, m) in merges.iter().take(20).enumerate() {
+            if let gguf::MetaValue::Str(s) = m {
+                eprintln!("  {:>4}: {:?}", i, s);
+            }
+        }
+    } else {
+        eprintln!("\nNo merges found in GGUF metadata");
+    }
+}
+
+fn run_chat(path_arg: Option<&String>, prompt: Option<&str>) {
+    let prompt = prompt.unwrap_or("What is 2+2? Answer in one sentence.");
+    let path = path_arg.map(|s| std::path::PathBuf::from(s)).unwrap_or_else(|| {
+        let mut p = std::env::current_dir().unwrap_or_default();
+        p.push("models");
+        if let Ok(entries) = std::fs::read_dir(&p) {
+            for e in entries.flatten() {
+                if e.path().extension().map(|x| x == "gguf").unwrap_or(false) {
+                    return e.path();
+                }
+            }
+        }
+        eprintln!("No .gguf file found."); std::process::exit(1);
+    });
+    eprintln!("Loading GGUF: {}", path.display());
+    let gguf = gguf::GGUFFile::open(&path).unwrap_or_else(|e| fatal(&e));
+
+    // Build vocab lookup
+    let vocab: Vec<String> = gguf.metadata.get("tokenizer.ggml.tokens")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| {
+            if let gguf::MetaValue::Str(s) = v { Some(s.clone()) } else { None }
+        }).collect())
+        .unwrap_or_default();
+
+    // Build reverse lookup: token_string -> id
+    let mut token_to_id: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for (i, t) in vocab.iter().enumerate() {
+        token_to_id.insert(t.clone(), i as u32);
+    }
+
+    // Load BPE merges
+    let merges: Vec<(String, String)> = gguf.metadata.get("tokenizer.ggml.merges")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| {
+            if let gguf::MetaValue::Str(s) = v {
+                let parts: Vec<&str> = s.splitn(2, ' ').collect();
+                if parts.len() == 2 { Some((parts[0].to_string(), parts[1].to_string())) }
+                else { None }
+            } else { None }
+        }).collect())
+        .unwrap_or_default();
+
+    // Build merge rank lookup
+    let merge_rank: std::collections::HashMap<(String, String), usize> = merges.iter()
+        .enumerate().map(|(i, (a, b))| ((a.clone(), b.clone()), i)).collect();
+
+    // GPT-2 byte-to-unicode mapping (Llama 3 uses this)
+    let byte_to_unicode: Vec<char> = {
+        let mut table = vec!['\0'; 256];
+        // Printable ASCII (33-126): maps to themselves
+        // Plus some Latin-1: 161-172, 174-255
+        let mut bs: Vec<u8> = (b'!'..=b'~').collect();
+        bs.extend(161u8..=172);
+        bs.extend(174u8..=255);
+        let mut cs: Vec<u32> = bs.iter().map(|&b| b as u32).collect();
+        // All other bytes get mapped starting at 256
+        let mut n = 0u32;
+        for b in 0u8..=255 {
+            if !bs.contains(&b) {
+                bs.push(b);
+                cs.push(256 + n);
+                n += 1;
+            }
+        }
+        for (&b, &c) in bs.iter().zip(cs.iter()) {
+            table[b as usize] = char::from_u32(c).unwrap_or('?');
+        }
+        table
+    };
+
+    // BPE encode a string
+    let bpe_encode = |text: &str| -> Vec<u32> {
+        // Convert bytes to GPT-2 unicode characters
+        let mut tokens: Vec<String> = text.bytes().map(|b| {
+            let c = byte_to_unicode[b as usize];
+            let mut s = String::new();
+            s.push(c);
+            s
+        }).collect();
+
+        // Apply BPE merges greedily
+        loop {
+            let mut best_rank = usize::MAX;
+            let mut best_idx = 0;
+            for i in 0..tokens.len().saturating_sub(1) {
+                let pair = (tokens[i].clone(), tokens[i + 1].clone());
+                if let Some(&rank) = merge_rank.get(&pair) {
+                    if rank < best_rank {
+                        best_rank = rank;
+                        best_idx = i;
+                    }
+                }
+            }
+            if best_rank == usize::MAX { break; }
+            let merged = format!("{}{}", tokens[best_idx], tokens[best_idx + 1]);
+            tokens[best_idx] = merged;
+            tokens.remove(best_idx + 1);
+        }
+
+        tokens.iter().map(|t| {
+            *token_to_id.get(t).unwrap_or(&0)
+        }).collect()
+    };
+
+    // Find special token IDs
+    let find_special = |name: &str| -> u32 {
+        *token_to_id.get(name).unwrap_or(&0)
+    };
+
+    let bos = gguf.config.bos_token;
+    let start_header = find_special("<|start_header_id|>");
+    let end_header = find_special("<|end_header_id|>");
+    let eot = find_special("<|eot_id|>");
+    let eos = gguf.config.eos_token;
+
+    eprintln!("Special tokens: BOS={bos} start_header={start_header} end_header={end_header} eot={eot} eos={eos}");
+
+    // Build Llama 3.3 chat format:
+    // <|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|>
+    // <|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>
+    // <|start_header_id|>assistant<|end_header_id|>\n\n
+    let mut tokens: Vec<u32> = Vec::new();
+    tokens.push(bos);
+    tokens.push(start_header);
+    tokens.extend(bpe_encode("system"));
+    tokens.push(end_header);
+    tokens.extend(bpe_encode("\n\nYou are a helpful assistant."));
+    tokens.push(eot);
+    tokens.push(start_header);
+    tokens.extend(bpe_encode("user"));
+    tokens.push(end_header);
+    tokens.extend(bpe_encode(&format!("\n\n{prompt}")));
+    tokens.push(eot);
+    tokens.push(start_header);
+    tokens.extend(bpe_encode("assistant"));
+    tokens.push(end_header);
+    tokens.extend(bpe_encode("\n\n"));
+
+    eprintln!("Prompt tokens ({}):", tokens.len());
+    for (i, &t) in tokens.iter().enumerate() {
+        let name = if (t as usize) < vocab.len() { &vocab[t as usize] } else { "?" };
+        eprintln!("  [{i:>3}] {t:>6} = {:?}", name);
+    }
+
+    // Load model and run inference
+    let mdl = model::Model::load(&gguf).unwrap_or_else(|e| fatal(&e));
+    let batch = infer_batch::BatchState::new(&mdl).unwrap_or_else(|e| fatal(&e));
+
+    eprintln!("\n--- Prefill ({} tokens) ---", tokens.len());
+    let t0 = std::time::Instant::now();
+    let pos = infer_batch::prefill(&mdl, &batch, &tokens);
+    let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("Prefill: {:.0}ms ({:.0} tok/s)", prefill_ms, tokens.len() as f64 / t0.elapsed().as_secs_f64());
+
+    // Decode
+    eprintln!("\n--- Generating ---\n");
+    let first = infer_batch::argmax_one(&batch);
+    let mut generated = vec![first];
+    let mut next = first;
+    let max_gen = 256u32;
+    let t1 = std::time::Instant::now();
+    for i in 0..max_gen - 1 {
+        next = infer_batch::decode_step(&mdl, &batch, next, pos + i);
+        if next == eos || next == eot { break; }
+        generated.push(next);
+    }
+    let decode_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let decode_tps = generated.len() as f64 / t1.elapsed().as_secs_f64();
+
+    // Decode to text using GPT-2 unicode-to-byte mapping
+    let unicode_to_byte: std::collections::HashMap<char, u8> = byte_to_unicode.iter()
+        .enumerate().map(|(b, &c)| (c, b as u8)).collect();
+    let decode_token = |t: u32| -> String {
+        if (t as usize) >= vocab.len() { return format!("[{t}]"); }
+        let tok_str = &vocab[t as usize];
+        // Special tokens
+        if tok_str.starts_with("<|") { return String::new(); }
+        // Convert GPT-2 unicode chars back to bytes
+        let bytes: Vec<u8> = tok_str.chars().map(|c| {
+            *unicode_to_byte.get(&c).unwrap_or(&b'?')
+        }).collect();
+        String::from_utf8_lossy(&bytes).to_string()
+    };
+    let text: String = generated.iter().map(|&t| decode_token(t)).collect();
+    println!("{text}");
+
+    eprintln!("\n--- Stats ---");
+    eprintln!("  Generated: {} tokens in {:.0}ms = {:.1} tok/s", generated.len(), decode_ms, decode_tps);
 }
 
 fn fatal(msg: &str) -> ! {
