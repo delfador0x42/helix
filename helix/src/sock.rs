@@ -116,7 +116,7 @@ fn handle_ambient_fast(line: &str) -> String {
     let file_path = crate::hook::extract_json_str(line, "\"path\"").unwrap_or("");
     let syms = extract_syms_array(line);
     crate::mcp::with_index(|data| {
-        crate::hook::query_ambient(data, stem, file_path, &syms, None)
+        crate::ambient::query_ambient(data, stem, file_path, &syms, None)
     }).unwrap_or_default()
 }
 
@@ -169,14 +169,14 @@ fn handle_hook_relay(line: &str) -> String {
 
     let syms = if is_edit {
         match crate::json::parse(line) {
-            Ok(val) => crate::hook::extract_removed_syms(&val, stem),
+            Ok(val) => crate::ambient::extract_removed_syms(&val, stem),
             Err(_) => vec![],
         }
     } else { vec![] };
     let sym_refs: Vec<&str> = syms.iter().map(|s| s.as_str()).collect();
 
     let ctx = crate::mcp::with_index(|data| {
-        crate::hook::query_ambient(data, stem, path, &sym_refs, None)
+        crate::ambient::query_ambient(data, stem, path, &sym_refs, None)
     }).unwrap_or_default();
     if ctx.is_empty() { return String::new(); }
     crate::hook::hook_output(&ctx)

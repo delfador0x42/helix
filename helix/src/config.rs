@@ -74,8 +74,6 @@ pub fn hierarchy_distance(topic: &str, query: &str) -> Option<usize> {
 
 pub fn log_path(dir: &Path) -> PathBuf { dir.join("data.log") }
 
-pub fn index_path(dir: &Path) -> PathBuf { dir.join("index.bin") }
-
 /// Atomic file write: write to .tmp, fsync, rename.
 pub fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<(), String> {
     use std::io::Write;

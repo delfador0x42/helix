@@ -42,7 +42,6 @@ impl CachedEntry {
     pub fn tags(&self) -> &[String] { &self.meta().tags }
     pub fn source(&self) -> Option<&str> { self.meta().source.as_deref() }
     pub fn confidence(&self) -> f64 { self.meta().confidence }
-    pub fn links(&self) -> &[(String, usize)] { &self.meta().links }
     pub fn has_tag(&self, tag: &str) -> bool { self.tags().iter().any(|t| t == tag) }
 
     pub fn date_str(&self) -> String {
@@ -61,8 +60,6 @@ impl CachedEntry {
         }
         ""
     }
-    pub fn confidence_u8(&self) -> u8 { (self.confidence().clamp(0.0, 1.0) * 255.0) as u8 }
-    pub fn has_links(&self) -> bool { !self.links().is_empty() }
 }
 
 struct CachedCorpus {
@@ -141,16 +138,6 @@ pub fn append_to_cache(dir: &Path, topic: &str, body: &str, ts_min: i32, offset:
         offset, tf_map, word_count, snippet, meta: std::cell::OnceCell::new(),
     });
     cache.mtime = cur_mtime;
-}
-
-pub struct CacheStats { pub entries: usize, pub cached: bool }
-
-pub fn stats() -> CacheStats {
-    let guard = CACHE.lock().unwrap();
-    match guard.as_ref() {
-        Some(c) => CacheStats { entries: c.entries.len(), cached: true },
-        None => CacheStats { entries: 0, cached: false },
-    }
 }
 
 /// "[topic] YYYY-MM-DD HH:MM first_content_lines"

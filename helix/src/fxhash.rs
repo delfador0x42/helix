@@ -45,7 +45,3 @@ pub fn map_with_capacity<K, V>(cap: usize) -> FxHashMap<K, V> {
     HashMap::with_capacity_and_hasher(cap, FxBuildHasher::default())
 }
 
-#[inline]
-pub fn set_with_capacity<T>(cap: usize) -> FxHashSet<T> {
-    HashSet::with_capacity_and_hasher(cap, FxBuildHasher::default())
-}

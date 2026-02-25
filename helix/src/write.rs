@@ -35,19 +35,6 @@ pub fn store(
     Ok(msg)
 }
 
-/// Lean batch write — no lock, no dupe check.
-pub fn batch_entry(
-    dir: &Path, topic: &str, text: &str, tags: Option<&str>, source: Option<&str>,
-) -> Result<String, String> {
-    crate::config::ensure_dir(dir)?;
-    let log_path = crate::datalog::ensure_log(dir)?;
-    let cleaned_tags = tags.map(normalize_tags);
-    let body = build_body(text, cleaned_tags.as_deref(), source, None, None);
-    let ts_min = LocalTime::now().to_minutes() as i32;
-    crate::datalog::append_entry(&log_path, topic, &body, ts_min)?;
-    Ok(format!("stored in {topic}"))
-}
-
 /// Batch write to pre-opened handle — no lock, no fsync.
 pub fn batch_entry_to(
     f: &mut std::fs::File, topic: &str, text: &str, tags: Option<&str>, source: Option<&str>,

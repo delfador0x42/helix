@@ -68,12 +68,6 @@ pub fn append_delete(log_path: &Path, target_offset: u32) -> Result<(), String> 
     Ok(())
 }
 
-/// Read a single entry at offset.
-pub fn read_entry(log_path: &Path, offset: u32) -> Result<LogEntry, String> {
-    let mut f = File::open(log_path).map_err(|e| format!("open data.log: {e}"))?;
-    read_entry_from(&mut f, offset)
-}
-
 pub fn read_entry_from(f: &mut File, offset: u32) -> Result<LogEntry, String> {
     f.seek(SeekFrom::Start(offset as u64)).map_err(|e| e.to_string())?;
     let mut hdr = [0u8; ENTRY_HEADER_SIZE];

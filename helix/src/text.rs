@@ -206,11 +206,10 @@ pub struct EntryMetadata {
     pub source: Option<String>,
     pub tags: Vec<String>,
     pub confidence: f64,
-    pub links: Vec<(String, usize)>,
 }
 
 pub fn extract_all_metadata(body: &str) -> EntryMetadata {
-    let (mut source, mut tags, mut confidence, mut links) = (None, Vec::new(), 1.0, Vec::new());
+    let (mut source, mut tags, mut confidence) = (None, Vec::new(), 1.0);
     for line in body.lines() {
         if !line.starts_with('[') { continue; }
         if let Some(inner) = line.strip_prefix("[tags: ").and_then(|s| s.strip_suffix(']')) {
@@ -220,14 +219,9 @@ pub fn extract_all_metadata(body: &str) -> EntryMetadata {
         } else if let Some(c) = line.strip_prefix("[confidence: ")
             .and_then(|s| s.strip_suffix(']')).and_then(|s| s.trim().parse::<f64>().ok()) {
             confidence = c;
-        } else if let Some(inner) = line.strip_prefix("[links: ").and_then(|s| s.strip_suffix(']')) {
-            links = inner.split_whitespace().filter_map(|pair| {
-                let (topic, idx) = pair.rsplit_once(':')?;
-                Some((topic.to_string(), idx.parse().ok()?))
-            }).collect();
         }
     }
-    EntryMetadata { source, tags, confidence, links }
+    EntryMetadata { source, tags, confidence }
 }
 
 pub fn extract_tags(lines: &[impl AsRef<str>]) -> Option<String> {

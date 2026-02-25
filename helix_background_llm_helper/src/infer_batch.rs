@@ -307,6 +307,149 @@ pub fn decode_step(model: &Model, batch: &BatchState, token: u32, position: u32)
     argmax_one(batch)
 }
 
+/// Decode step with frequency-based repetition penalty. Reads FP16 logits from unified
+/// memory (zero-copy), applies penalty^freq[token] to suppress repetition exponentially.
+/// freq array: 256KB for 128K vocab (u16 per token), fits L2 cache.
+/// Cost: ~128K (f16→f32 + lookup + pow_table + compare) ≈ 200ns. Negligible vs 170ms decode.
+pub fn decode_step_penalized(
+    model: &Model, batch: &BatchState, token: u32, position: u32,
+    freq: &[u16], vocab_size: u32, penalty: f32,
+) -> u32 {
+    forward_batch_n(model, batch, &[token], position, 1);
+    // Precompute penalty powers: penalty^1 through penalty^32 (cap at 32)
+    let mut pow_table = [1.0f32; 33]; // pow_table[0]=1.0 (no penalty), [1]=p, [2]=p^2, ...
+    for i in 1..33 { pow_table[i] = pow_table[i - 1] * penalty; }
+    let ptr = batch.logits.contents() as *const u16;
+    let mut best_val = f32::NEG_INFINITY;
+    let mut best_idx = 0u32;
+    for i in 0..vocab_size {
+        let bits = unsafe { *ptr.add(i as usize) };
+        let mut val = f16_to_f32(bits);
+        let f = freq[i as usize].min(32) as usize;
+        if f > 0 {
+            let p = pow_table[f];
+            if val > 0.0 { val /= p; } else { val *= p; }
+        }
+        if val > best_val { best_val = val; best_idx = i; }
+    }
+    best_idx
+}
+
+/// Decode step with top-p (nucleus) sampling + frequency penalty + temperature.
+/// 1. Run forward pass  2. Read FP16 logits (zero-copy unified memory)
+/// 3. Apply freq penalty  4. Temperature scale  5. Partial sort top-256
+/// 6. Softmax over nucleus  7. Accumulate to p  8. Sample
+/// Overhead: ~45μs on top of 170ms GPU decode = 0.03%.
+pub fn decode_step_sampled(
+    model: &Model, batch: &BatchState, token: u32, position: u32,
+    freq: &[u16], vocab_size: u32, penalty: f32,
+    temperature: f32, top_p: f32, rng: &mut u64,
+) -> u32 {
+    forward_batch_n(model, batch, &[token], position, 1);
+    let mut pow_table = [1.0f32; 33];
+    for i in 1..33 { pow_table[i] = pow_table[i - 1] * penalty; }
+    let ptr = batch.logits.contents() as *const u16;
+
+    // Pass 1: read logits, apply freq penalty, collect into Vec
+    let mut candidates: Vec<(f32, u32)> = Vec::with_capacity(vocab_size as usize);
+    for i in 0..vocab_size {
+        let bits = unsafe { *ptr.add(i as usize) };
+        let mut val = f16_to_f32(bits);
+        let f = freq[i as usize].min(32) as usize;
+        if f > 0 {
+            let p = pow_table[f];
+            if val > 0.0 { val /= p; } else { val *= p; }
+        }
+        candidates.push((val / temperature, i));
+    }
+
+    // Pass 2: partition to get top-256, then sort those descending
+    let k = 256.min(candidates.len());
+    candidates.select_nth_unstable_by(k - 1, |a, b| b.0.partial_cmp(&a.0).unwrap());
+    let top = &mut candidates[..k];
+    top.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
+    // Pass 3: softmax over top-k (numerically stable)
+    let max_logit = top[0].0;
+    let mut probs: Vec<(f32, u32)> = Vec::with_capacity(k);
+    let mut sum = 0.0f32;
+    for &(logit, idx) in top.iter() {
+        let p = (logit - max_logit).exp();
+        sum += p;
+        probs.push((p, idx));
+    }
+    // Normalize
+    for p in probs.iter_mut() { p.0 /= sum; }
+
+    // Pass 4: accumulate to top_p, then sample within nucleus
+    let mut cumsum = 0.0f32;
+    let mut nucleus_end = probs.len();
+    for (i, &(p, _)) in probs.iter().enumerate() {
+        cumsum += p;
+        if cumsum >= top_p {
+            nucleus_end = i + 1;
+            break;
+        }
+    }
+
+    // Renormalize nucleus and sample
+    let nucleus_sum: f32 = probs[..nucleus_end].iter().map(|p| p.0).sum();
+    let r = xorshift_f32(rng);
+    let mut acc = 0.0f32;
+    for &(p, idx) in &probs[..nucleus_end] {
+        acc += p / nucleus_sum;
+        if acc >= r { return idx; }
+    }
+    probs[nucleus_end - 1].1 // fallback
+}
+
+/// xorshift64 PRNG — 1 cycle per call on ARM.
+#[inline]
+fn xorshift64(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// Uniform f32 in [0, 1) from xorshift64.
+#[inline]
+fn xorshift_f32(state: &mut u64) -> f32 {
+    (xorshift64(state) >> 40) as f32 / (1u64 << 24) as f32
+}
+
+/// Increment frequency counter for a token.
+#[inline]
+pub fn freq_inc(freq: &mut [u16], token: u32) {
+    let idx = token as usize;
+    if idx < freq.len() { freq[idx] = freq[idx].saturating_add(1); }
+}
+
+#[inline]
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1F) as u32;
+    let mant = (bits & 0x3FF) as u32;
+    if exp == 0 {
+        if mant == 0 { return f32::from_bits(sign << 31); }
+        // Subnormal
+        let mut m = mant;
+        let mut e = 1u32;
+        while m & 0x400 == 0 { m <<= 1; e += 1; }
+        let m = (m & 0x3FF) << (23 - 10);
+        let e = (127 - 15 + 1 - e) << 23;
+        return f32::from_bits((sign << 31) | e | m);
+    }
+    if exp == 31 {
+        return f32::from_bits((sign << 31) | 0x7F800000 | (mant << 13));
+    }
+    let e = (exp + 127 - 15) << 23;
+    let m = mant << (23 - 10);
+    f32::from_bits((sign << 31) | e | m)
+}
+
 /// Profiled forward pass: times each operation group separately.
 pub fn forward_profiled(
     model: &Model, batch: &BatchState, tokens: &[u32],

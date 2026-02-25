@@ -90,6 +90,40 @@ fn escape_fmt(s: &str, f: &mut fmt::Formatter) -> fmt::Result {
     Ok(())
 }
 
+/// Fast JSON string extraction by key — no full parse, ~10ns for typical keys.
+pub fn extract_json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let kb = key.as_bytes();
+    let quoted = kb.first() == Some(&b'"');
+    let mut needle_buf = [0u8; 80];
+    let nlen = if quoted {
+        if kb.len() + 2 > needle_buf.len() { return None; }
+        needle_buf[..kb.len()].copy_from_slice(kb);
+        needle_buf[kb.len()] = b':';
+        needle_buf[kb.len() + 1] = b'"';
+        kb.len() + 2
+    } else {
+        if kb.len() + 4 > needle_buf.len() { return None; }
+        needle_buf[0] = b'"';
+        needle_buf[1..1 + kb.len()].copy_from_slice(kb);
+        needle_buf[1 + kb.len()] = b'"';
+        needle_buf[2 + kb.len()] = b':';
+        needle_buf[3 + kb.len()] = b'"';
+        kb.len() + 4
+    };
+    let needle = unsafe { std::str::from_utf8_unchecked(&needle_buf[..nlen]) };
+    let pos = json.find(needle)?;
+    let rest = &json[pos + nlen..];
+    let bytes = rest.as_bytes();
+    let mut end = 0;
+    while end < bytes.len() {
+        if bytes[end] == b'"' && (end == 0 || bytes[end - 1] != b'\\') {
+            return Some(&rest[..end]);
+        }
+        end += 1;
+    }
+    None
+}
+
 // --- Parser ---
 
 pub fn parse(input: &str) -> Result<Value, String> {
