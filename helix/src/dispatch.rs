@@ -12,7 +12,14 @@ pub(crate) fn dispatch(name: &str, args: Option<&Value>, dir: &Path) -> Result<S
     }
     match name {
         "store" => {
-            let topic = arg(args, "topic"); let text = arg(args, "text");
+            let raw_topic = arg(args, "topic"); let text = arg(args, "text");
+            let owned_topic;
+            let topic = if raw_topic.is_empty() {
+                owned_topic = crate::session::Session::load()
+                    .and_then(|s| s.focus_topics.first().cloned())
+                    .unwrap_or_else(|| "scratch".into());
+                owned_topic.as_str()
+            } else { raw_topic };
             let tags = opt(arg(args, "tags")); let force = abool(args, "force");
             let terse = abool(args, "terse"); let source = opt(arg(args, "source"));
             let conf = arg(args, "confidence").parse::<f64>().ok().filter(|c| *c >= 0.0 && *c <= 1.0);
@@ -127,11 +134,25 @@ fn dispatch_batch(args: Option<&Value>, dir: &Path) -> Result<String, String> {
     drop(f); drop(_lock);
     if ok > 0 { crate::mcp::after_write(dir); }
     if verbose { Ok(format!("batch: {ok}/{} stored\n{}", items.len(), out.join("\n"))) }
-    else { Ok(format!("batch: {ok}/{} stored", items.len())) }
+    else {
+        let mut terse = format!("batch: {ok}/{} stored", items.len());
+        let indices: Vec<&str> = out.iter()
+            .filter(|s| !s.contains("skipped") && !s.contains("err:"))
+            .filter_map(|s| s.split(']').next().and_then(|p| p.split('[').nth(1)))
+            .collect();
+        if !indices.is_empty() {
+            terse.push_str(" ["); terse.push_str(&indices.join(", ")); terse.push(']');
+        }
+        Ok(terse)
+    }
 }
 
 fn dispatch_search(args: Option<&Value>, dir: &Path) -> Result<String, String> {
     let raw_query = arg(args, "query"); let detail = arg(args, "detail");
+    let queries_raw = arg(args, "queries");
+    if !queries_raw.is_empty() {
+        return dispatch_batch_search(queries_raw, detail, args, dir);
+    }
     let parsed = crate::text::parse_query_filters(raw_query);
     let query = if parsed.query.is_empty() { raw_query } else { &parsed.query };
     let mut filter = build_filter(args);
@@ -145,12 +166,53 @@ fn dispatch_search(args: Option<&Value>, dir: &Path) -> Result<String, String> {
         "grouped" => crate::mcp::with_index_slice(|idx| {
             crate::search::run_grouped(dir, query, limit, &filter, idx)
         })?,
-        _ => crate::mcp::with_index_slice(|idx| match detail {
-            "full" => crate::search::run(dir, query, limit, &filter, idx),
-            "brief" => crate::search::run_brief(dir, query, limit, &filter, idx),
-            _ => crate::search::run_medium(dir, query, limit, &filter, idx),
-        })?,
+        _ => {
+            let expand = abool(args, "expand");
+            let max_lines = if expand { usize::MAX } else {
+                arg(args, "lines").parse().unwrap_or(2)
+            };
+            let full_body = expand || detail == "full";
+            crate::mcp::with_index_slice(|idx| match detail {
+                "full" => crate::search::run(dir, query, limit, &filter, idx),
+                "brief" => crate::search::run_brief(dir, query, limit, &filter, idx),
+                _ => crate::search::run_medium(dir, query, limit, &filter, idx, max_lines, full_body),
+            })?
+        }
     }
+}
+
+fn dispatch_batch_search(queries_raw: &str, detail: &str, args: Option<&Value>, dir: &Path)
+    -> Result<String, String>
+{
+    let owned: Vec<String> = match crate::json::parse(queries_raw) {
+        Ok(crate::json::Value::Arr(arr)) => arr.iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+        _ => queries_raw.split(',').map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()).collect(),
+    };
+    if owned.is_empty() { return Err("queries array is empty".into()); }
+    let queries: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    let filter = build_filter(args);
+    let limit = arg(args, "limit").parse::<usize>().ok();
+    let full_body = detail == "full";
+    let (results, fallback) = crate::mcp::with_index_slice(|idx| {
+        crate::score::batch_search_scored(dir, &queries, &filter, limit, idx, full_body)
+    })??;
+    let mut out = String::new();
+    if fallback { let _ = writeln!(out, "(some queries used OR fallback)"); }
+    let _ = writeln!(out, "batch search: {} queries, {} results\n", queries.len(), results.len());
+    for r in &results {
+        let header = r.lines.first().map(|s| s.as_str()).unwrap_or("??");
+        let _ = write!(out, "  [{}] {} ({:.1})\n", r.name, header.trim_start_matches("## "), r.score);
+        let mut n = 0;
+        for line in r.lines.iter().skip(1) {
+            if crate::text::is_metadata_line(line) || line.trim().is_empty() { continue; }
+            let _ = writeln!(out, "    {}", crate::text::truncate(line.trim(), 100));
+            n += 1;
+            if !full_body && n >= 2 { break; }
+        }
+    }
+    Ok(out)
 }
 
 fn dispatch_edit(args: Option<&Value>, dir: &Path) -> Result<String, String> {
@@ -223,10 +285,16 @@ fn dispatch_trace(args: Option<&Value>) -> Result<String, String> {
                 let root = path.parent().unwrap_or(&path);
                 Ok(crate::codegraph::file_symbols(root, &path))
             } else {
+                let sym_limit = arg(args, "limit").parse::<usize>().unwrap_or(usize::MAX);
+                let sym_filter = opt(arg(args, "filter"));
                 let files = crate::codegraph::walk_source_files(&path);
                 let mut out = String::with_capacity(1024);
                 let mut total = 0;
                 for file in &files {
+                    if let Some(pat) = sym_filter {
+                        let fname = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        if !glob_match(pat, fname) { continue; }
+                    }
                     let content = match std::fs::read_to_string(file) { Ok(c) => c, Err(_) => continue };
                     let rel = file.strip_prefix(&path).unwrap_or(file).to_string_lossy();
                     let syms = crate::codegraph::extract_symbols(&content, &rel);
@@ -235,8 +303,10 @@ fn dispatch_trace(args: Option<&Value>) -> Result<String, String> {
                         for s in &syms {
                             let _ = writeln!(out, "  {} {} :{}  {}", s.kind, s.name, s.line, s.signature);
                             total += 1;
+                            if total >= sym_limit { break; }
                         }
                     }
+                    if total >= sym_limit { break; }
                 }
                 let _ = writeln!(out, "\n{total} symbols in {} files", files.len());
                 Ok(out)
@@ -296,5 +366,16 @@ fn dispatch_trace(args: Option<&Value>) -> Result<String, String> {
             let root = if path.is_file() { path.parent().unwrap_or(&path).to_path_buf() } else { path };
             Ok(crate::codegraph::trace_symbol(&root, symbol))
         }
+    }
+}
+
+/// Simple glob: supports *.ext and prefix* patterns.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    if let Some(ext) = pattern.strip_prefix("*.") {
+        name.ends_with(ext) && name.len() > ext.len() && name.as_bytes()[name.len() - ext.len() - 1] == b'.'
+    } else if let Some(prefix) = pattern.strip_suffix('*') {
+        name.starts_with(prefix)
+    } else {
+        name == pattern
     }
 }

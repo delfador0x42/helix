@@ -53,7 +53,20 @@ pub fn topic_name(data: &[u8], topic_id: u16) -> Result<String, String> {
 }
 
 pub fn resolve_topic(data: &[u8], name: &str) -> Option<u16> {
-    topic_table(data).ok()?.iter().find(|(_, n, _)| n == name).map(|(id, _, _)| *id)
+    let hdr = read_header(data).ok()?;
+    let top_off = { hdr.topics_off } as usize;
+    let tname_off = { hdr.topic_names_off } as usize;
+    let ntop = { hdr.num_topics } as usize;
+    let nb = name.as_bytes();
+    for i in 0..ntop {
+        let te = read_at::<TopicEntry>(data, top_off + i * std::mem::size_of::<TopicEntry>()).ok()?;
+        let no = tname_off + { te.name_off } as usize;
+        let nl = { te.name_len } as usize;
+        if nl == nb.len() && no + nl <= data.len() && &data[no..no + nl] == nb {
+            return Some(i as u16);
+        }
+    }
+    None
 }
 
 pub fn resolve_tag(data: &[u8], tag_name: &str) -> Option<u8> {
@@ -124,6 +137,19 @@ pub fn xref_edges(data: &[u8]) -> Result<Vec<(u16, u16, u16)>, String> {
         out.push(({ x.src_topic }, { x.dst_topic }, { x.mention_count }));
     }
     Ok(out)
+}
+
+pub fn entry_source_ref(data: &[u8], entry_id: u32) -> Option<&str> {
+    let hdr = read_header(data).ok()?;
+    let meta_off = { hdr.meta_off } as usize;
+    let src_off = { hdr.source_off } as usize;
+    if entry_id as usize >= { hdr.num_entries } as usize { return None; }
+    let m = read_at::<EntryMeta>(data, meta_off + entry_id as usize * std::mem::size_of::<EntryMeta>()).ok()?;
+    let sl = { m.source_len } as usize;
+    if sl == 0 { return None; }
+    let so = src_off + { m.source_off } as usize;
+    if so + sl > data.len() { return None; }
+    std::str::from_utf8(&data[so..so + sl]).ok()
 }
 
 pub fn entry_snippet_ref(data: &[u8], entry_id: u32) -> Result<&str, String> {

@@ -74,12 +74,15 @@ pub(crate) const FILTER_PROPS: &[(&str, &str, &str)] = &[
 fn tool_list() -> Value {
     let search_props: Vec<(&str, &str, &str)> = [
         ("query", "string", "Search query"),
+        ("queries", "string", "JSON array of query strings for batch search (e.g. '[\"ExecPolicy\",\"relay buffer\"]'). Deduplicates results across queries."),
         ("detail", "string", "Result detail level: 'full' (complete entry), 'medium' (default, 2 lines), 'brief' (topic+first line), 'count' (match count only), 'topics' (hits per topic), 'grouped' (results by topic)"),
+        ("expand", "string", "Set 'true' to return full entry bodies in medium mode (collapses search+read)"),
+        ("lines", "string", "Content lines per result in medium mode (default: 2)"),
     ].into_iter().chain(FILTER_PROPS.iter().copied()).collect();
 
     Value::Arr(vec![
-        tool("store", "Store a timestamped knowledge entry under a topic. Warns on duplicate content.",
-            &["topic", "text"],
+        tool("store", "Store a timestamped knowledge entry under a topic. Topic auto-inferred from session focus if omitted.",
+            &["text"],
             &[("topic", "string", "Topic name"), ("text", "string", "Entry content"),
               ("tags", "string", "Comma-separated tags (e.g. 'bug,p0,iris')"),
               ("force", "string", "Set to 'true' to bypass duplicate detection"),
@@ -130,7 +133,9 @@ fn tool_list() -> Value {
             &["path"],
             &[("path", "string", "Project directory or file path"),
               ("symbol", "string", "Symbol name to trace"),
-              ("action", "string", "Operation: symbols|blast|analyze|omit for trace")]),
+              ("action", "string", "Operation: symbols|blast|analyze|omit for trace"),
+              ("limit", "string", "Max symbols to return (for symbols action)"),
+              ("filter", "string", "Glob filter on filename (for symbols action, e.g. '*.swift')")]),
         tool("_reload", "Re-exec the server binary to pick up code changes.", &[], &[]),
     ])
 }

@@ -169,7 +169,13 @@ fn ambient(input: &str, dir: &Path) -> Result<String, String> {
     session.tick_tool(data_log_mtime(dir));
     session.track_file(is_edit || tool == "Write" || tool == "NotebookEdit");
     let mut out = crate::ambient::query_ambient(data, stem, file_path, &sym_refs, Some(&mut session));
-    if session.tool_calls_since_store >= 10 {
+    let threshold = match session.phase {
+        crate::session::Phase::Debug => 5,
+        crate::session::Phase::Build => 8,
+        crate::session::Phase::Verify => 12,
+        crate::session::Phase::Research | crate::session::Phase::Unknown => 15,
+    };
+    if session.tool_calls_since_store >= threshold {
         if !out.is_empty() { out.push_str("---\n"); }
         out.push_str("DISCIPLINE: ");
         crate::text::itoa_push(&mut out, session.tool_calls_since_store);

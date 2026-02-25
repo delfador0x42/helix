@@ -57,10 +57,10 @@ pub fn run_brief(dir: &Path, query: &str, limit: Option<usize>, filter: &Filter,
 }
 
 pub fn run_medium(dir: &Path, query: &str, limit: Option<usize>, filter: &Filter,
-                  index_data: Option<&[u8]>) -> Result<String, String> {
+                  index_data: Option<&[u8]>, max_lines: usize, full_body: bool) -> Result<String, String> {
     let terms = query_terms(query);
     if terms.is_empty() { return Err("provide a query".into()); }
-    let (results, fallback) = crate::index::search_scored(dir, &terms, filter, limit, index_data, false)?;
+    let (results, fallback) = crate::index::search_scored(dir, &terms, filter, limit, index_data, full_body)?;
     let mut out = String::new();
     if fallback { let _ = writeln!(out, "(no exact match — showing OR results)"); }
     for r in &results {
@@ -74,7 +74,7 @@ pub fn run_medium(dir: &Path, query: &str, limit: Option<usize>, filter: &Filter
             if crate::text::is_metadata_line(line) || line.trim().is_empty() { continue; }
             let _ = writeln!(out, "    {}", truncate(line.trim(), 100));
             n += 1;
-            if n >= 2 { break; }
+            if n >= max_lines { break; }
         }
     }
     if results.is_empty() { let _ = writeln!(out, "no matches for '{query}'"); }

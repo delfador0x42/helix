@@ -159,6 +159,7 @@ pub(crate) fn do_reexec() {
     use std::os::unix::process::CommandExt;
     let exe = match std::env::current_exe() { Ok(p) => p, Err(_) => return };
     let args: Vec<String> = std::env::args().skip(1).collect();
+    std::env::set_var("HELIX_REEXEC", "1");
     let _err = std::process::Command::new(&exe).args(&args).exec();
     eprintln!("helix reload failed: {_err}");
 }

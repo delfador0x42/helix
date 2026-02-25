@@ -79,7 +79,7 @@ pub(crate) fn ensure_index_fresh(dir: &Path) {
 
 // ══════════ Server Loop ══════════
 
-const INIT_RESULT: &str = r#"{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"helix","version":"1.2.0"}}"#;
+const INIT_RESULT: &str = r#"{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"helix","version":"1.2.0"}}"#;
 
 pub fn run(dir: &Path) -> Result<(), String> {
     crate::config::ensure_dir(dir)?;
@@ -90,6 +90,13 @@ pub fn run(dir: &Path) -> Result<(), String> {
     }
     let stdin = io::stdin();
     let stdout = io::stdout();
+    // After re-exec, notify client that tools may have changed
+    if std::env::var_os("HELIX_REEXEC").is_some() {
+        std::env::remove_var("HELIX_REEXEC");
+        let mut out = stdout.lock();
+        let _ = out.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n");
+        let _ = out.flush();
+    }
     let mut line_buf = String::with_capacity(4096);
     let mut reader = io::BufReader::new(stdin.lock());
     loop {
