@@ -23,6 +23,9 @@ const MAX_SEQ: u32 = 2048;
 /// Batch inference state: FP16 buffers + batch pipelines.
 pub struct BatchState {
     pub batch_size: u32,
+    // Metal 4 cooperative tensor pipelines (optional — None if Metal 4 unavailable)
+    pub p_q5k_coop: Option<Pipeline>,
+    pub p_q5k_coop_add: Option<Pipeline>,
     // MMA staging grid pipelines (primary batch path)
     pub p_q5k_grid: Pipeline,
     pub p_q5k_grid_add: Pipeline, // Fused Y += W×X (residual add in matmul)
@@ -76,6 +79,29 @@ impl BatchState {
         let pipe = |name: &str| -> Result<Pipeline, String> {
             let f = lib.get_function(name)?;
             model.device.new_compute_pipeline(&f)
+        };
+
+        // Metal 4 cooperative tensor kernels (optional — graceful fallback)
+        let (p_q5k_coop, p_q5k_coop_add) = {
+            let m4_src = kernels_batch::metal4_kernels();
+            match model.device.new_library_with_source_metal4(&m4_src) {
+                Ok(m4_lib) => {
+                    let m4_pipe = |name: &str| -> Option<Pipeline> {
+                        m4_lib.get_function(name).ok()
+                            .and_then(|f| model.device.new_compute_pipeline(&f).ok())
+                    };
+                    let p1 = m4_pipe("matmul_q5k_coop");
+                    let p2 = m4_pipe("matmul_q5k_coop_add");
+                    if p1.is_some() {
+                        eprintln!("metal4: cooperative tensor Q5K matmul enabled");
+                    }
+                    (p1, p2)
+                }
+                Err(e) => {
+                    eprintln!("metal4: cooperative tensor compile failed: {e}");
+                    (None, None)
+                }
+            }
         };
 
         // MMA staging grid: batch matmul for Q5K/Q6K/Q8_0
@@ -139,6 +165,7 @@ impl BatchState {
 
         Ok(BatchState {
             batch_size: bs,
+            p_q5k_coop, p_q5k_coop_add,
             p_q5k_grid, p_q5k_grid_add, p_q6k_grid, p_q6k_grid_add,
             p_q6k_grid_silu_add, p_q8_0_grid,
             p_matvec_q5k, p_matvec_q6k, p_matvec_q8_0,
@@ -411,7 +438,7 @@ fn dispatch_embed(enc: &ComputeEncoder, model: &Model, batch: &BatchState, bs: u
     );
 }
 
-/// Matmul dispatch: n=1 → scalar matvec, n>1 → MMA staging grid.
+/// Matmul dispatch: n=1 → scalar matvec, n>1 → MMA staging grid (or Metal 4 coop).
 fn dispatch_matmul(
     enc: &ComputeEncoder, model: &Model, batch: &BatchState,
     dtype: GGMLType, quant_off: u64,
@@ -419,6 +446,9 @@ fn dispatch_matmul(
 ) {
     if b <= 1 {
         dispatch_matvec(enc, model, batch, dtype, quant_off, x, y, cols, rows);
+    } else if dtype == GGMLType::Q5K && batch.p_q5k_coop.is_some() {
+        dispatch_mma_coop(enc, model, batch.p_q5k_coop.as_ref().unwrap(),
+            quant_off, x, y, cols, rows, b);
     } else {
         let pipe = match dtype {
             GGMLType::Q5K  => &batch.p_q5k_grid,
@@ -438,9 +468,11 @@ fn dispatch_matmul_add(
     x: &Buffer, y: &Buffer, cols: u32, rows: u32, b: u32,
 ) {
     if b <= 1 {
-        // Scalar path: matvec to norm_out then add. TODO: fused scalar variant.
         dispatch_matvec(enc, model, batch, dtype, quant_off, x, &batch.norm_out, cols, rows);
         dispatch_residual_add(enc, batch, y, &batch.norm_out, rows as u64);
+    } else if dtype == GGMLType::Q5K && batch.p_q5k_coop_add.is_some() {
+        dispatch_mma_coop(enc, model, batch.p_q5k_coop_add.as_ref().unwrap(),
+            quant_off, x, y, cols, rows, b);
     } else {
         let pipe = match dtype {
             GGMLType::Q5K => &batch.p_q5k_grid_add,
@@ -480,6 +512,28 @@ fn dispatch_matmul_silu_add(
             MTLSize::new(128, 1, 1),
         );
     }
+}
+
+/// Metal 4 cooperative tensor matmul dispatch.
+/// Grid: (ceil(B/TILE_M), ceil(rows/TILE_N)), TG: 128 = 4 SIMD groups.
+/// TILE_M=80 (batch), TILE_N=32 (rows) — matches gen_matmul_q5k_coop.
+fn dispatch_mma_coop(
+    enc: &ComputeEncoder, model: &Model, pipe: &Pipeline,
+    quant_off: u64, x: &Buffer, y: &Buffer, cols: u32, rows: u32, b: u32,
+) {
+    enc.set_pipeline(pipe);
+    enc.set_buffer(0, &model.weights, quant_off);
+    enc.set_buffer(1, x, 0);
+    enc.set_buffer(2, y, 0);
+    enc.set_bytes(3, &cols as *const u32 as *const c_void, 4);
+    enc.set_bytes(4, &rows as *const u32 as *const c_void, 4);
+    enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+    let batch_tiles = ((b as u64 + TILE_B as u64 - 1) / TILE_B as u64) as u64;
+    let row_groups = ((rows + 31) / 32) as u64;
+    enc.dispatch_threadgroups(
+        MTLSize::new(batch_tiles, row_groups, 1),
+        MTLSize::new(128, 1, 1),
+    );
 }
 
 /// Scalar matvec: n=1, simd_sum reduction. Bandwidth-optimal for single token.

@@ -1312,6 +1312,190 @@ kernel void argmax_batch(
 }
 "#;
 
+// ── Metal 4 cooperative tensor kernels ──
+
+/// Metal 4 header: includes tensor types + MetalPerformancePrimitives.
+const METAL4_HEADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp;
+using namespace mpp::tensor_ops;
+"#;
+
+/// Generate Metal 4 cooperative tensor Q5K matmul kernel.
+/// Uses matmul2d with user-controlled K-loop: dequant full Q5K block (256 elems)
+/// to threadgroup, then Apple's optimized matmul2d for the MMA phase.
+/// Optimized dequant: hoists d/dmin/scales per sub-block, sequential access.
+/// Grid: (ceil(B/TILE_M), ceil(rows/TILE_N)), TG: 128 = 4 SIMD groups.
+pub fn gen_matmul_q5k_coop(name: &str, tile_m: u32, tile_n: u32, residual_add: bool) -> String {
+    let tile_k: u32 = 256; // full Q5K block — maximizes matmul2d work per call
+    let mut s = String::with_capacity(10000);
+
+    s += &format!("kernel void {name}(\n");
+    s += "    device const uchar *W     [[buffer(0)]],\n";
+    s += "    device half        *X     [[buffer(1)]],\n";
+    s += "    device half        *Y     [[buffer(2)]],\n";
+    s += "    constant uint      &cols  [[buffer(3)]],\n";
+    s += "    constant uint      &rows  [[buffer(4)]],\n";
+    s += "    constant uint      &batch [[buffer(5)]],\n";
+    s += "    uint2 tgid [[threadgroup_position_in_grid]],\n";
+    s += "    uint  lid  [[thread_index_in_threadgroup]]\n";
+    s += ") {\n";
+
+    s += &format!("    constexpr int TILE_M = {tile_m};\n");  // batch
+    s += &format!("    constexpr int TILE_N = {tile_n};\n");  // rows
+    s += &format!("    constexpr int TILE_K = {tile_k};\n");  // K per pass = full Q5K block
+
+    s += "    int b_off = int(tgid.x) * TILE_M;\n";
+    s += "    int row_base = int(tgid.y) * TILE_N;\n";
+    s += "    int icols = int(cols), irows = int(rows), ibatch = int(batch);\n";
+    s += "    if (row_base >= irows) return;\n";
+    s += "\n";
+
+    // 32 rows × 256 K = 8192 halfs = 16KB threadgroup memory
+    s += "    threadgroup half w_tile[TILE_N * TILE_K];\n";
+    s += "\n";
+
+    // matmul2d: C[TILE_M × TILE_N] = X[TILE_M × TILE_K] × W^T[TILE_K × TILE_N]
+    s += "    constexpr auto desc = matmul2d_descriptor(\n";
+    s += "        TILE_M, TILE_N, TILE_K,\n";
+    s += "        false, true,\n";
+    s += "        false,\n";
+    s += "        matmul2d_descriptor::mode::multiply_accumulate);\n";
+    s += "    matmul2d<desc, execution_simdgroups<4>> matmulOp;\n";
+    s += "\n";
+
+    s += "    using x_tensor_t = tensor<device half, dextents<int, 2>, tensor_inline>;\n";
+    s += "    using w_tensor_t = tensor<threadgroup half, extents<int, TILE_N, TILE_K>, tensor_inline>;\n";
+    s += "\n";
+
+    // Create cooperative tensor accumulator
+    s += "    auto cT = matmulOp.get_destination_cooperative_tensor<x_tensor_t, w_tensor_t, half>();\n";
+
+    if residual_add {
+        s += "    {\n";
+        s += "        array<int, 2> y_str = {irows, 1};\n";
+        s += "        x_tensor_t yT(Y + b_off * irows + row_base,\n";
+        s += "            dextents<int, 2>(min(TILE_M, ibatch - b_off), min(TILE_N, irows - row_base)), y_str);\n";
+        s += "        cT.load(yT);\n";
+        s += "    }\n";
+    } else {
+        s += "    #pragma clang loop unroll(full)\n";
+        s += "    for (uint16_t i = 0; i < cT.get_capacity(); ++i)\n";
+        s += "        if (cT.is_valid_element(i)) cT[i] = 0.0h;\n";
+    }
+    s += "\n";
+
+    s += "    int blocks_per_row = icols / 256;\n";
+    s += "    int row_bytes = blocks_per_row * 176;\n";
+    s += "\n";
+
+    // Optimized dequant: each thread owns a row slice, hoists d/dmin per block,
+    // hoists sc/mn per sub-block. 128 threads across 32 rows × 256 K elements.
+    // Each thread handles 32*256/128 = 64 elements (2 rows × 32 elems, or similar)
+    s += "    int my_row_in_tile = lid / 4;   // 0..31 — 4 threads per row\n";
+    s += "    int my_lane = lid % 4;           // 0..3 — which 64-element chunk\n";
+    s += "    int global_row = row_base + my_row_in_tile;\n";
+    s += "    bool valid = global_row < irows;\n";
+    s += "\n";
+
+    // K-loop: one full Q5K block (256 elements) per iteration
+    s += "    for (int bi = 0; bi < blocks_per_row; bi++) {\n";
+    s += "        device const uchar *blk = valid ? W + global_row * row_bytes + bi * 176 : W;\n";
+    s += "        half d_val = valid ? *((device const half *)(blk)) : 0.0h;\n";
+    s += "        half dmin_val = valid ? *((device const half *)(blk + 2)) : 0.0h;\n";
+    s += "        device const uchar *scales = blk + 4;\n";
+    s += "        device const uchar *qh = blk + 16;\n";
+    s += "        device const uchar *qs = blk + 48;\n";
+    s += "\n";
+
+    // Each thread dequants its 64-element chunk (my_lane selects pair 0-3)
+    s += "        int pair = my_lane;\n";
+    s += "        for (int sub = 0; sub < 2; sub++) {\n";
+    s += "            int sb = pair * 2 + sub;\n";
+    s += "            half ds = 0.0h, dm = 0.0h;\n";
+    s += "            if (valid) {\n";
+    s += "                int sc_i, mn_i;\n";
+    s += "                if (sb < 4) { sc_i = scales[sb] & 63; mn_i = scales[sb + 4] & 63; }\n";
+    s += "                else { sc_i = (scales[sb + 4] & 0xF) | ((scales[sb - 4] >> 6) << 4);\n";
+    s += "                       mn_i = (scales[sb + 4] >> 4) | ((scales[sb] >> 6) << 4); }\n";
+    s += "                ds = d_val * half(sc_i); dm = dmin_val * half(mn_i);\n";
+    s += "            }\n";
+    s += "            int k_base = sb * 32;\n";
+    s += "            for (int k = 0; k < 32; k++) {\n";
+    s += "                half w = 0.0h;\n";
+    s += "                if (valid) {\n";
+    s += "                    int nibble = (int(qs[pair * 32 + k]) >> (sub * 4)) & 0xF;\n";
+    s += "                    int hb = (int(qh[k]) >> sb) & 1;\n";
+    s += "                    w = ds * half(nibble | (hb << 4)) - dm;\n";
+    s += "                }\n";
+    s += "                w_tile[my_row_in_tile * TILE_K + k_base + k] = w;\n";
+    s += "            }\n";
+    s += "        }\n";
+    s += "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "\n";
+
+    // Create tensor views and run matmul2d
+    s += "        array<int, 2> x_str = {icols, 1};\n";
+    s += "        x_tensor_t xT(X + b_off * icols + bi * 256,\n";
+    s += "            dextents<int, 2>(min(TILE_M, ibatch - b_off), TILE_K), x_str);\n";
+    s += "        w_tensor_t wT(&w_tile[0], extents<int, TILE_N, TILE_K>());\n";
+    s += "\n";
+    s += "        matmulOp.run(xT, wT, cT);\n";
+    s += "\n";
+    s += "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "    }\n";
+    s += "\n";
+
+    // Store result
+    s += "    {\n";
+    s += "        array<int, 2> y_str = {irows, 1};\n";
+    s += "        x_tensor_t yT(Y + b_off * irows + row_base,\n";
+    s += "            dextents<int, 2>(min(TILE_M, ibatch - b_off), min(TILE_N, irows - row_base)), y_str);\n";
+    s += "        cT.store(yT);\n";
+    s += "    }\n";
+    s += "}\n\n";
+    s
+}
+
+/// Build Metal 4 cooperative tensor kernel source (compiled separately with Metal 4.0).
+pub fn metal4_kernels() -> String {
+    let mut s = METAL4_HEADER.to_string();
+    // Include Q5K dequant helper from main header
+    s += r#"
+inline half q5k_dequant(device const uchar *blk, uint elem) {
+    half d    = *((device const half *)(blk));
+    half dmin = *((device const half *)(blk + 2));
+    device const uchar *scales = blk + 4;
+    device const uchar *qh = blk + 16;
+    device const uchar *qs = blk + 48;
+    uint pair = elem / 64;
+    uint sub = (elem / 32) & 1;
+    uint l = elem & 31;
+    int is_val = int(pair * 2 + sub);
+    int sc_i, mn_i;
+    if (is_val < 4) {
+        sc_i = scales[is_val] & 63;
+        mn_i = scales[is_val + 4] & 63;
+    } else {
+        sc_i = (scales[is_val + 4] & 0xF) | ((scales[is_val - 4] >> 6) << 4);
+        mn_i = (scales[is_val + 4] >> 4) | ((scales[is_val] >> 6) << 4);
+    }
+    uchar qb = qs[pair * 32 + l];
+    uint nibble = (qb >> (sub * 4)) & 0xF;
+    uint hb = (qh[l] >> (pair * 2 + sub)) & 1;
+    return (d * half(sc_i)) * half(nibble | (hb << 4)) - (dmin * half(mn_i));
+}
+"#;
+    // Q5K cooperative tensor matmul: tile_m=80 (batch), tile_n=32 (rows)
+    s += &gen_matmul_q5k_coop("matmul_q5k_coop", 80, 32, false);
+    s += &gen_matmul_q5k_coop("matmul_q5k_coop_add", 80, 32, true);
+    s
+}
+
 // ── Kernel assembly ──
 
 /// Build all batch Metal source: Q5K/Q6K/Q8_0 MMA + matvec + embed + element-wise.

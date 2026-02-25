@@ -269,10 +269,23 @@ impl Device {
     }
 
     pub fn new_library_with_source(&self, source: &str) -> Result<Library, String> {
+        self.new_library_with_source_version(source, 0) // 0 = default version
+    }
+
+    /// Compile Metal shader source with Metal 4.0 language version.
+    /// Required for cooperative tensors, matmul2d, tensor types.
+    pub fn new_library_with_source_metal4(&self, source: &str) -> Result<Library, String> {
+        self.new_library_with_source_version(source, 4 << 16) // MTLLanguageVersion4_0 = 262144
+    }
+
+    fn new_library_with_source_version(&self, source: &str, version: u64) -> Result<Library, String> {
         unsafe {
             let src = nsstring(source);
             let opts_cls = cls("MTLCompileOptions\0");
             let opts: Id = msg_id(opts_cls, sel("new\0"));
+            if version != 0 {
+                msg_void_u64(opts, sel("setLanguageVersion:\0"), version);
+            }
             let mut err: Id = ptr::null_mut();
             let lib = msg_id_id_id_ptr(
                 self.0,
