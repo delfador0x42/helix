@@ -9,7 +9,8 @@ use crate::model::Model;
 use crate::kernels_batch;
 use std::ffi::c_void;
 
-/// Grid tile size for MMA kernels. Matches register-optimal at B=80.
+/// Grid tile size for MMA kernels. 80 = 10 batch groups per staging pass.
+/// Optimal on M3 Max: 96→47tok/s (occupancy loss), 80→59tok/s, 160 hangs.
 const TILE_B: u32 = 80;
 
 /// Maximum batch size supported (tokens per forward pass).
@@ -24,7 +25,10 @@ pub struct BatchState {
     pub batch_size: u32,
     // MMA staging grid pipelines (primary batch path)
     pub p_q5k_grid: Pipeline,
+    pub p_q5k_grid_add: Pipeline, // Fused Y += W×X (residual add in matmul)
     pub p_q6k_grid: Pipeline,
+    pub p_q6k_grid_add: Pipeline, // Fused Y += W×X for Q6K weights
+    pub p_q6k_grid_silu_add: Pipeline, // Fused Y += Wdown × silu(Gate) * Up
     pub p_q8_0_grid: Pipeline,
     // Scalar matvec (n=1 decode, bandwidth-optimal for single token)
     pub p_matvec_q5k: Pipeline,
@@ -76,7 +80,10 @@ impl BatchState {
 
         // MMA staging grid: batch matmul for Q5K/Q6K/Q8_0
         let p_q5k_grid = pipe("matmul_q5k_grid")?;
+        let p_q5k_grid_add = pipe("matmul_q5k_grid_add")?;
         let p_q6k_grid = pipe("matmul_q6k_grid")?;
+        let p_q6k_grid_add = pipe("matmul_q6k_grid_add")?;
+        let p_q6k_grid_silu_add = pipe("matmul_q6k_grid_silu_add")?;
         let p_q8_0_grid = pipe("matmul_q8_0_grid")?;
         // Scalar matvec: n=1 decode
         let p_matvec_q5k = pipe("matvec_q5k_f16")?;
@@ -132,7 +139,8 @@ impl BatchState {
 
         Ok(BatchState {
             batch_size: bs,
-            p_q5k_grid, p_q6k_grid, p_q8_0_grid,
+            p_q5k_grid, p_q5k_grid_add, p_q6k_grid, p_q6k_grid_add,
+            p_q6k_grid_silu_add, p_q8_0_grid,
             p_matvec_q5k, p_matvec_q6k, p_matvec_q8_0,
             p_embed_q5k, p_embed_q6k, p_embed_q8_0,
             p_rmsnorm, p_residual_rmsnorm,
@@ -216,11 +224,9 @@ pub fn forward_batch_n(
         // SiLU(gate) * up
         dispatch_silu(&enc, batch, cfg.ffn_dim as u64 * b as u64);
 
-        // Down + residual: x += W_down @ ffn_mid
-        dispatch_matmul(&enc, model, batch, lo.ffn_down_type,
-            lo.ffn_down, &batch.ffn_mid, &batch.norm_out, cfg.ffn_dim, cfg.hidden_dim, b);
-        dispatch_residual_add(&enc, batch, &batch.x, &batch.norm_out,
-            cfg.hidden_dim as u64 * b as u64);
+        // Fused down + residual: x += W_down @ ffn_mid (single kernel, zero extra BW)
+        dispatch_matmul_add(&enc, model, batch, lo.ffn_down_type,
+            lo.ffn_down, &batch.ffn_mid, &batch.x, cfg.ffn_dim, cfg.hidden_dim, b);
     }
 
     // Final RMSNorm
@@ -359,13 +365,8 @@ pub fn forward_profiled(
         });
 
         timed!(matmul_us, |enc: &ComputeEncoder| {
-            dispatch_matmul(enc, model, batch, lo.ffn_down_type,
-                lo.ffn_down, &batch.ffn_mid, &batch.norm_out, cfg.ffn_dim, cfg.hidden_dim, b);
-        });
-
-        timed!(elem_us, |enc: &ComputeEncoder| {
-            dispatch_residual_add(enc, batch, &batch.x, &batch.norm_out,
-                cfg.hidden_dim as u64 * b as u64);
+            dispatch_matmul_add(enc, model, batch, lo.ffn_down_type,
+                lo.ffn_down, &batch.ffn_mid, &batch.x, cfg.ffn_dim, cfg.hidden_dim, b);
         });
     }
 
@@ -429,6 +430,58 @@ fn dispatch_matmul(
     }
 }
 
+/// Fused matmul+residual_add: y += W × x. Accumulators initialized from y.
+/// For n=1, falls back to matvec then explicit add (no fused scalar variant yet).
+fn dispatch_matmul_add(
+    enc: &ComputeEncoder, model: &Model, batch: &BatchState,
+    dtype: GGMLType, quant_off: u64,
+    x: &Buffer, y: &Buffer, cols: u32, rows: u32, b: u32,
+) {
+    if b <= 1 {
+        // Scalar path: matvec to norm_out then add. TODO: fused scalar variant.
+        dispatch_matvec(enc, model, batch, dtype, quant_off, x, &batch.norm_out, cols, rows);
+        dispatch_residual_add(enc, batch, y, &batch.norm_out, rows as u64);
+    } else {
+        let pipe = match dtype {
+            GGMLType::Q5K => &batch.p_q5k_grid_add,
+            GGMLType::Q6K => &batch.p_q6k_grid_add,
+            _ => panic!("matmul_add unsupported dtype: {:?}", dtype),
+        };
+        dispatch_mma_grid(enc, model, pipe, quant_off, x, y, cols, rows, b);
+    }
+}
+
+/// Fused silu + Wdown + residual: x += Wdown × silu(Gate) * Up.
+/// Batch path uses single kernel. Scalar (n=1) falls back to silu then matvec+add.
+fn dispatch_matmul_silu_add(
+    enc: &ComputeEncoder, model: &Model, batch: &BatchState,
+    quant_off: u64, cols: u32, rows: u32, b: u32,
+) {
+    if b <= 1 {
+        // Scalar path: explicit silu then matvec+add
+        dispatch_silu(enc, batch, cols as u64);
+        dispatch_matvec(enc, model, batch, GGMLType::Q6K, quant_off,
+            &batch.ffn_mid, &batch.norm_out, cols, rows);
+        dispatch_residual_add(enc, batch, &batch.x, &batch.norm_out, rows as u64);
+    } else {
+        let pipe = &batch.p_q6k_grid_silu_add;
+        enc.set_pipeline(pipe);
+        enc.set_buffer(0, &model.weights, quant_off);
+        enc.set_buffer(1, &batch.gate, 0);
+        enc.set_buffer(2, &batch.up, 0);
+        enc.set_buffer(3, &batch.x, 0);
+        enc.set_bytes(4, &cols as *const u32 as *const c_void, 4);
+        enc.set_bytes(5, &rows as *const u32 as *const c_void, 4);
+        enc.set_bytes(6, &b as *const u32 as *const c_void, 4);
+        let row_groups = ((rows + 31) / 32) as u64;
+        let batch_tiles = ((b as u64 + TILE_B as u64 - 1) / TILE_B as u64) as u64;
+        enc.dispatch_threadgroups(
+            MTLSize::new(row_groups, batch_tiles, 1),
+            MTLSize::new(128, 1, 1),
+        );
+    }
+}
+
 /// Scalar matvec: n=1, simd_sum reduction. Bandwidth-optimal for single token.
 fn dispatch_matvec(
     enc: &ComputeEncoder, model: &Model, batch: &BatchState,
@@ -456,25 +509,63 @@ fn dispatch_matvec(
     );
 }
 
+/// M3 Max L2 cache: ~32MB. When X exceeds this, split dispatch into waves.
+const L2_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Grid-tiled MMA staging: dequant in threadgroup memory → simdgroup MMA.
 /// Grid: (ceil(rows/32), ceil(b/tile_b)), TG: 128 (4 SGs × 8 rows).
+/// L2 wave tiling: if X (b × cols × 2) exceeds L2, split batch into waves
+/// that each fit in L2. Prevents cache thrashing on FFN Down (28672 cols).
 fn dispatch_mma_grid(
     enc: &ComputeEncoder, model: &Model, pipe: &Pipeline,
     quant_off: u64, x: &Buffer, y: &Buffer, cols: u32, rows: u32, b: u32,
 ) {
-    enc.set_pipeline(pipe);
-    enc.set_buffer(0, &model.weights, quant_off);
-    enc.set_buffer(1, x, 0);
-    enc.set_buffer(2, y, 0);
-    enc.set_bytes(3, &cols as *const u32 as *const c_void, 4);
-    enc.set_bytes(4, &rows as *const u32 as *const c_void, 4);
-    enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+    let x_bytes = b as u64 * cols as u64 * 2;
     let row_groups = ((rows + 31) / 32) as u64;
-    let batch_tiles = ((b as u64 + TILE_B as u64 - 1) / TILE_B as u64) as u64;
-    enc.dispatch_threadgroups(
-        MTLSize::new(row_groups, batch_tiles, 1),
-        MTLSize::new(128, 1, 1),
-    );
+
+    if x_bytes <= L2_CACHE_BYTES {
+        // Fast path: X fits in L2, single dispatch
+        enc.set_pipeline(pipe);
+        enc.set_buffer(0, &model.weights, quant_off);
+        enc.set_buffer(1, x, 0);
+        enc.set_buffer(2, y, 0);
+        enc.set_bytes(3, &cols as *const u32 as *const c_void, 4);
+        enc.set_bytes(4, &rows as *const u32 as *const c_void, 4);
+        enc.set_bytes(5, &b as *const u32 as *const c_void, 4);
+        let batch_tiles = ((b as u64 + TILE_B as u64 - 1) / TILE_B as u64) as u64;
+        enc.dispatch_threadgroups(
+            MTLSize::new(row_groups, batch_tiles, 1),
+            MTLSize::new(128, 1, 1),
+        );
+    } else {
+        // L2 wave tiling: split batch into waves that fit in L2.
+        // Each wave processes wave_b tokens. Waves execute sequentially
+        // (Metal serial dispatch) so L2 contains only one wave's X data.
+        let max_wave_b = (L2_CACHE_BYTES / (cols as u64 * 2)) as u32;
+        // Round down to TILE_B boundary for clean dispatch
+        let wave_b = (max_wave_b / TILE_B) * TILE_B;
+        let wave_b = if wave_b == 0 { TILE_B } else { wave_b };
+
+        let mut offset = 0u32;
+        while offset < b {
+            let this_b = std::cmp::min(wave_b, b - offset);
+            let x_off = offset as u64 * cols as u64 * 2;
+            let y_off = offset as u64 * rows as u64 * 2;
+            enc.set_pipeline(pipe);
+            enc.set_buffer(0, &model.weights, quant_off);
+            enc.set_buffer(1, x, x_off);
+            enc.set_buffer(2, y, y_off);
+            enc.set_bytes(3, &cols as *const u32 as *const c_void, 4);
+            enc.set_bytes(4, &rows as *const u32 as *const c_void, 4);
+            enc.set_bytes(5, &this_b as *const u32 as *const c_void, 4);
+            let batch_tiles = ((this_b as u64 + TILE_B as u64 - 1) / TILE_B as u64) as u64;
+            enc.dispatch_threadgroups(
+                MTLSize::new(row_groups, batch_tiles, 1),
+                MTLSize::new(128, 1, 1),
+            );
+            offset += this_b;
+        }
+    }
 }
 
 fn dispatch_rmsnorm(

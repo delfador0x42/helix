@@ -2,7 +2,8 @@
 //! Each MMA kernel dequants quantized weights in threadgroup memory, then uses
 //! simdgroup_multiply_accumulate for hardware FP16 MMA throughput.
 
-/// Tile size for grid-tiled MMA kernels.
+/// Tile size for grid-tiled MMA kernels. 80 = 10 batch groups per staging pass.
+/// 80 is optimal on M3 Max: 96 is 20% slower (lower occupancy), 160 hangs.
 pub const TILE_B: u32 = 80;
 
 /// MSL header: includes, dequant helpers for Q6K and Q5K.
@@ -13,28 +14,30 @@ pub const HEADER_STR: &str = r#"
 using namespace metal;
 
 // Q6K dequant: extract one of 256 elements from a 210-byte Q6K block.
-inline float q6k_dequant(device const uchar *blk, uint elem) {
+// All intermediate math in half — 6-bit values fit comfortably.
+inline half q6k_dequant(device const uchar *blk, uint elem) {
     device const uchar *ql = blk, *qh = blk + 128;
     device const char *sc = (device const char *)(blk + 192);
-    float d = float(*((device const half *)(blk + 208)));
+    half d = *((device const half *)(blk + 208));
     uint n = elem / 128, rem = elem % 128, l = rem % 32, sub = rem / 32;
     device const uchar *qlp = ql + n * 64, *qhp = qh + n * 32;
     uint sb = n * 8, is_off = l / 16;
-    int q; float ds;
+    int q; half ds;
     switch (sub) {
-        case 0: q = (int(qlp[l] & 0xF) | (int((qhp[l] >> 0) & 3) << 4)) - 32; ds = d * float(sc[sb+is_off+0]); break;
-        case 1: q = (int(qlp[l+32] & 0xF) | (int((qhp[l] >> 2) & 3) << 4)) - 32; ds = d * float(sc[sb+is_off+2]); break;
-        case 2: q = (int(qlp[l] >> 4) | (int((qhp[l] >> 4) & 3) << 4)) - 32; ds = d * float(sc[sb+is_off+4]); break;
-        default: q = (int(qlp[l+32] >> 4) | (int((qhp[l] >> 6) & 3) << 4)) - 32; ds = d * float(sc[sb+is_off+6]); break;
+        case 0: q = (int(qlp[l] & 0xF) | (int((qhp[l] >> 0) & 3) << 4)) - 32; ds = d * half(sc[sb+is_off+0]); break;
+        case 1: q = (int(qlp[l+32] & 0xF) | (int((qhp[l] >> 2) & 3) << 4)) - 32; ds = d * half(sc[sb+is_off+2]); break;
+        case 2: q = (int(qlp[l] >> 4) | (int((qhp[l] >> 4) & 3) << 4)) - 32; ds = d * half(sc[sb+is_off+4]); break;
+        default: q = (int(qlp[l+32] >> 4) | (int((qhp[l] >> 6) & 3) << 4)) - 32; ds = d * half(sc[sb+is_off+6]); break;
     }
-    return ds * float(q);
+    return ds * half(q);
 }
 
 // Q5K dequant: extract one of 256 elements from a 176-byte Q5K block.
 // Layout: d(2) + dmin(2) + scales(12) + qh(32) + qs(128) = 176 bytes.
-inline float q5k_dequant(device const uchar *blk, uint elem) {
-    float d    = float(*((device const half *)(blk)));
-    float dmin = float(*((device const half *)(blk + 2)));
+// All intermediate math in half — 5-bit values, max output ~±200.
+inline half q5k_dequant(device const uchar *blk, uint elem) {
+    half d    = *((device const half *)(blk));
+    half dmin = *((device const half *)(blk + 2));
     device const uchar *scales = blk + 4;
     device const uchar *qh = blk + 16;
     device const uchar *qs = blk + 48;
@@ -42,18 +45,18 @@ inline float q5k_dequant(device const uchar *blk, uint elem) {
     uint sub = (elem / 32) & 1;
     uint l = elem & 31;
     int is_val = int(pair * 2 + sub);
-    float sc, mn;
+    int sc_i, mn_i;
     if (is_val < 4) {
-        sc = float(scales[is_val] & 63);
-        mn = float(scales[is_val + 4] & 63);
+        sc_i = scales[is_val] & 63;
+        mn_i = scales[is_val + 4] & 63;
     } else {
-        sc = float((scales[is_val + 4] & 0xF) | ((scales[is_val - 4] >> 6) << 4));
-        mn = float((scales[is_val + 4] >> 4) | ((scales[is_val] >> 6) << 4));
+        sc_i = (scales[is_val + 4] & 0xF) | ((scales[is_val - 4] >> 6) << 4);
+        mn_i = (scales[is_val + 4] >> 4) | ((scales[is_val] >> 6) << 4);
     }
     uchar qb = qs[pair * 32 + l];
     uint nibble = (qb >> (sub * 4)) & 0xF;
     uint hb = (qh[l] >> (pair * 2 + sub)) & 1;
-    return (d * sc) * float(nibble + hb * 16) - (dmin * mn);
+    return (d * half(sc_i)) * half(nibble | (hb << 4)) - (dmin * half(mn_i));
 }
 "#;
 
@@ -63,8 +66,18 @@ inline float q5k_dequant(device const uchar *blk, uint elem) {
 /// Key optimization: within a sub-block, all elements in a lane share the same
 /// row, hence the same d/dmin/sc/mn. Hoists shared dequant values to eliminate
 /// ~60% of per-element ALU (from ~15 ops to ~5 ops per element).
+/// When `residual_add` is true, accumulators are loaded from Y (fused Y += W×X).
 /// Grid: (ceil(rows/32), ceil(b/tile_b)), TG: 128 = 4 SG.
 pub fn gen_matmul_q5k_mma_grid(name: &str, tile_b: u32) -> String {
+    gen_matmul_q5k_mma_grid_inner(name, tile_b, false)
+}
+
+/// Q5K MMA with fused residual add: Y += W × X (accumulators initialized from Y).
+pub fn gen_matmul_q5k_mma_grid_add(name: &str, tile_b: u32) -> String {
+    gen_matmul_q5k_mma_grid_inner(name, tile_b, true)
+}
+
+fn gen_matmul_q5k_mma_grid_inner(name: &str, tile_b: u32, residual_add: bool) -> String {
     assert!(tile_b % 8 == 0, "tile_b must be multiple of 8");
     let n_groups = tile_b / 8;
     let mut s = String::with_capacity(12000);
@@ -78,83 +91,87 @@ pub fn gen_matmul_q5k_mma_grid(name: &str, tile_b: u32) -> String {
     s += "    uint3 tgid [[threadgroup_position_in_grid]],\n";
     s += "    uint3 tid  [[thread_position_in_threadgroup]]\n";
     s += ") {\n";
-    s += "    uint lid = tid.x;\n";
-    s += "    uint sgid = lid / 32;\n";
-    s += "    uint lane = lid % 32;\n";
-    s += "    uint row_base = tgid.x * 32;\n";
-    s += "    if (row_base >= rows) return;\n";
-    s += &format!("    uint b_off = tgid.y * {tile_b}u;\n");
+    // Signed integer indexing: enables Apple GPU vectorized loads + strength reduction.
+    s += "    int lid = int(tid.x);\n";
+    s += "    int sgid = lid / 32;\n";
+    s += "    int lane = lid % 32;\n";
+    s += "    int row_base = int(tgid.x) * 32;\n";
+    s += "    int icols = int(cols), irows = int(rows);\n";
+    s += "    if (row_base >= irows) return;\n";
+    s += &format!("    int b_off = int(tgid.y) * {tile_b};\n");
     s += "\n";
     s += "    threadgroup half tiles[4 * 32 * 9];\n";
     s += "    threadgroup half *tile = tiles + sgid * 32 * 9;\n";
     s += "\n";
-    for g in 0..n_groups {
-        if g % 4 == 0 {
-            let end = std::cmp::min(g + 4, n_groups);
-            s += "    simdgroup_half8x8 ";
-            for i in g..end {
-                if i > g { s += ", "; }
-                s += &format!("C{i}(0.0h)");
+    if residual_add {
+        for g in 0..n_groups {
+            let off = g * 8;
+            s += &format!("    simdgroup_half8x8 C{g};\n");
+            s += &format!("    simdgroup_load(C{g}, Y + (b_off + {off}) * irows + row_base + sgid * 8, ulong(irows));\n");
+        }
+    } else {
+        for g in 0..n_groups {
+            if g % 4 == 0 {
+                let end = std::cmp::min(g + 4, n_groups);
+                s += "    simdgroup_half8x8 ";
+                for i in g..end {
+                    if i > g { s += ", "; }
+                    s += &format!("C{i}(0.0h)");
+                }
+                s += ";\n";
             }
-            s += ";\n";
         }
     }
     s += "\n";
-    s += "    int blocks_per_row = int(cols / 256);\n";
+    // Q5K: 176 bytes/block. Layout: d(2) + dmin(2) + scales(12) + qh(32) + qs(128).
+    // Sub-blocked staging: hoist d/dmin/sc/mn per 32-element sub-block.
+    s += "    int blocks_per_row = icols / 256;\n";
     s += "    int row_bytes = blocks_per_row * 176;\n";
-    // lane -> (r, k_base): r = lane & 7 is constant per lane (the row within SG tile)
-    // k values = (lane/8) + {0,4,8,12,16,20,24,28} — 8 columns per lane
-    s += "    int my_r = int(lane & 7);\n";
-    s += "    int global_row = int(row_base) + int(sgid) * 8 + my_r;\n";
-    s += "    bool valid = global_row < int(rows);\n";
+    s += "    int my_r = lane & 7;\n";
+    s += "    int global_row = row_base + sgid * 8 + my_r;\n";
+    s += "    bool valid = global_row < irows;\n";
     s += "\n";
-    // Pre-compute the block pointer base for this row (constant across all blocks)
     s += "    device const uchar *row_w = W + global_row * row_bytes;\n";
     s += "\n";
     s += "    for (int bi = 0; bi < blocks_per_row; bi++) {\n";
-    // Load block header ONCE per block per lane (shared across 8 sub-blocks)
     s += "        device const uchar *blk = row_w + bi * 176;\n";
-    s += "        float d_val = valid ? float(*((device const half *)(blk))) : 0.0;\n";
-    s += "        float dmin_val = valid ? float(*((device const half *)(blk + 2))) : 0.0;\n";
+    s += "        half d_val = valid ? *((device const half *)(blk)) : 0.0h;\n";
+    s += "        half dmin_val = valid ? *((device const half *)(blk + 2)) : 0.0h;\n";
     s += "        device const uchar *scales = blk + 4;\n";
     s += "        device const uchar *qh = blk + 16;\n";
     s += "        device const uchar *qs = blk + 48;\n";
     s += "\n";
     s += "        for (int sb = 0; sb < 8; sb++) {\n";
-    // Within a sub-block, all 8 elements per lane share pair/sub/sc/mn:
-    // pair = sb/2, sub = sb&1. Hoist scale loads (shared across 8 cols per lane).
-    s += "            int pair = sb >> 1;\n";
-    s += "            int sub_idx = sb & 1;\n";
-    s += "            float ds = 0.0, dm = 0.0;\n";
+    s += "            half ds = 0.0h, dm = 0.0h;\n";
     s += "            if (valid) {\n";
-    s += "                float sc, mn;\n";
-    s += "                if (sb < 4) { sc = float(scales[sb] & 63); mn = float(scales[sb + 4] & 63); }\n";
-    s += "                else { sc = float((scales[sb + 4] & 0xF) | ((scales[sb - 4] >> 6) << 4)); mn = float((scales[sb + 4] >> 4) | ((scales[sb] >> 6) << 4)); }\n";
-    s += "                ds = d_val * sc; dm = dmin_val * mn;\n";
+    s += "                int sc_i, mn_i;\n";
+    s += "                if (sb < 4) { sc_i = scales[sb] & 63; mn_i = scales[sb + 4] & 63; }\n";
+    s += "                else { sc_i = (scales[sb + 4] & 0xF) | ((scales[sb - 4] >> 6) << 4); mn_i = (scales[sb + 4] >> 4) | ((scales[sb] >> 6) << 4); }\n";
+    s += "                ds = d_val * half(sc_i); dm = dmin_val * half(mn_i);\n";
     s += "            }\n";
+    s += "            int pair = sb >> 1;\n";
+    s += "            int sub = sb & 1;\n";
     s += "\n";
-    // Stage 8 elements per lane: r = lane & 7 (constant), k varies.
-    // Per-element work: 1 qb load + nibble extract + hb extract + multiply = ~5 ALU.
-    s += "            for (uint t = lane; t < 256; t += 32) {\n";
-    s += "                int k = int(t >> 3);\n";
-    s += "                int r = int(t & 7);\n";
+    s += "            for (int t = lane; t < 256; t += 32) {\n";
+    s += "                int k = t >> 3;\n";
+    s += "                int r = t & 7;\n";
     s += "                half w = 0.0h;\n";
     s += "                if (valid) {\n";
-    s += "                    uchar qb = qs[pair * 32 + k];\n";
-    s += "                    uint nibble = (uint(qb) >> (sub_idx * 4)) & 0xF;\n";
-    s += "                    uint hb = (uint(qh[k]) >> sb) & 1;\n";
-    s += "                    w = half(ds * float(nibble + hb * 16) - dm);\n";
+    s += "                    int qb = int(qs[pair * 32 + k]);\n";
+    s += "                    int nibble = (qb >> (sub * 4)) & 0xF;\n";
+    s += "                    int hb = (int(qh[k]) >> (pair * 2 + sub)) & 1;\n";
+    s += "                    w = ds * half(nibble | (hb << 4)) - dm;\n";
     s += "                }\n";
     s += "                tile[k * 9 + r] = w;\n";
     s += "            }\n";
     s += "            simdgroup_barrier(mem_flags::mem_threadgroup);\n";
     s += "\n";
-    s += "            for (uint ks = 0; ks < 4; ks++) {\n";
+    s += "            for (int ks = 0; ks < 4; ks++) {\n";
     s += "                simdgroup_half8x8 B;\n";
     s += "                simdgroup_load(B, tile + ks * 8 * 9, 9);\n";
     for g in 0..n_groups {
         let off = g * 8;
-        s += &format!("                {{ simdgroup_half8x8 A; simdgroup_load(A, X + (b_off + {off}u) * cols + bi * 256 + sb * 32 + ks * 8, cols); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
+        s += &format!("                {{ simdgroup_half8x8 A; simdgroup_load(A, X + (b_off + {off}) * icols + bi * 256 + sb * 32 + ks * 8, icols); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
     }
     s += "            }\n";
     s += "            simdgroup_barrier(mem_flags::mem_threadgroup);\n";
@@ -163,7 +180,7 @@ pub fn gen_matmul_q5k_mma_grid(name: &str, tile_b: u32) -> String {
     s += "\n";
     for g in 0..n_groups {
         let off = g * 8;
-        s += &format!("    simdgroup_store(C{g}, Y + (b_off + {off}u) * rows + row_base + sgid * 8, ulong(rows));\n");
+        s += &format!("    simdgroup_store(C{g}, Y + (b_off + {off}) * irows + row_base + sgid * 8, ulong(irows));\n");
     }
     s += "}\n\n";
     s
@@ -174,6 +191,15 @@ pub fn gen_matmul_q5k_mma_grid(name: &str, tile_b: u32) -> String {
 /// Q6K layout: ql[128] + qh[64] + sc[16] + d(2) = 210 bytes per 256-element block.
 /// Grid: (ceil(rows/32), ceil(b/tile_b)), TG: 128 = 4 SG.
 pub fn gen_matmul_q6k_mma_grid(name: &str, tile_b: u32) -> String {
+    gen_matmul_q6k_mma_grid_inner(name, tile_b, false)
+}
+
+/// Q6K MMA with fused residual add: Y += W × X.
+pub fn gen_matmul_q6k_mma_grid_add(name: &str, tile_b: u32) -> String {
+    gen_matmul_q6k_mma_grid_inner(name, tile_b, true)
+}
+
+fn gen_matmul_q6k_mma_grid_inner(name: &str, tile_b: u32, residual_add: bool) -> String {
     assert!(tile_b % 8 == 0, "tile_b must be multiple of 8");
     let n_groups = tile_b / 8;
     let mut s = String::with_capacity(12000);
@@ -187,87 +213,84 @@ pub fn gen_matmul_q6k_mma_grid(name: &str, tile_b: u32) -> String {
     s += "    uint3 tgid [[threadgroup_position_in_grid]],\n";
     s += "    uint3 tid  [[thread_position_in_threadgroup]]\n";
     s += ") {\n";
-    s += "    uint lid = tid.x;\n";
-    s += "    uint sgid = lid / 32;\n";
-    s += "    uint lane = lid % 32;\n";
-    s += "    uint row_base = tgid.x * 32;\n";
-    s += "    if (row_base >= rows) return;\n";
-    s += &format!("    uint b_off = tgid.y * {tile_b}u;\n");
+    // Signed integer indexing: enables Apple GPU vectorized loads + strength reduction.
+    s += "    int lid = int(tid.x);\n";
+    s += "    int sgid = lid / 32;\n";
+    s += "    int lane = lid % 32;\n";
+    s += "    int row_base = int(tgid.x) * 32;\n";
+    s += "    int icols = int(cols), irows = int(rows);\n";
+    s += "    if (row_base >= irows) return;\n";
+    s += &format!("    int b_off = int(tgid.y) * {tile_b};\n");
     s += "\n";
     s += "    threadgroup half tiles[4 * 32 * 9];\n";
     s += "    threadgroup half *tile = tiles + sgid * 32 * 9;\n";
     s += "\n";
-    for g in 0..n_groups {
-        if g % 4 == 0 {
-            let end = std::cmp::min(g + 4, n_groups);
-            s += "    simdgroup_half8x8 ";
-            for i in g..end {
-                if i > g { s += ", "; }
-                s += &format!("C{i}(0.0h)");
+    if residual_add {
+        for g in 0..n_groups {
+            let off = g * 8;
+            s += &format!("    simdgroup_half8x8 C{g};\n");
+            s += &format!("    simdgroup_load(C{g}, Y + (b_off + {off}) * irows + row_base + sgid * 8, ulong(irows));\n");
+        }
+    } else {
+        for g in 0..n_groups {
+            if g % 4 == 0 {
+                let end = std::cmp::min(g + 4, n_groups);
+                s += "    simdgroup_half8x8 ";
+                for i in g..end {
+                    if i > g { s += ", "; }
+                    s += &format!("C{i}(0.0h)");
+                }
+                s += ";\n";
             }
-            s += ";\n";
         }
     }
     s += "\n";
-    s += "    int blocks_per_row = int(cols / 256);\n";
+    s += "    int blocks_per_row = icols / 256;\n";
     s += "    int row_bytes = blocks_per_row * 210;\n";
-    s += "    int my_r = int(lane & 7);\n";
-    s += "    int global_row = int(row_base) + int(sgid) * 8 + my_r;\n";
-    s += "    bool valid = global_row < int(rows);\n";
+    s += "    int my_r = lane & 7;\n";
+    s += "    int global_row = row_base + sgid * 8 + my_r;\n";
+    s += "    bool valid = global_row < irows;\n";
     s += "    device const uchar *row_w = W + global_row * row_bytes;\n";
     s += "\n";
     s += "    for (int bi = 0; bi < blocks_per_row; bi++) {\n";
     s += "        device const uchar *blk = row_w + bi * 210;\n";
-    // Q6K layout: ql[128] at +0, qh[64] at +128, sc[16] at +192, d(2) at +208
     s += "        device const uchar *ql = blk;\n";
     s += "        device const uchar *qh_ptr = blk + 128;\n";
     s += "        device const char *sc = (device const char *)(blk + 192);\n";
-    s += "        float d_val = valid ? float(*((device const half *)(blk + 208))) : 0.0;\n";
+    s += "        half d_val = valid ? *((device const half *)(blk + 208)) : 0.0h;\n";
     s += "\n";
-    // Q6K sub-blocks: 8 sub-blocks of 32 elements each.
-    // elem = sb * 32 + k. n = elem / 128, rem = elem % 128, l = rem % 32, sub = rem / 32.
-    // For sb in 0..7, k in 0..31:
-    //   n = (sb*32+k)/128 = sb/4 (for k<32)
-    //   rem = (sb*32+k)%128 = (sb%4)*32+k
-    //   l = rem%32 = k
-    //   sub = rem/32 = sb%4
-    // So per sb: n = sb/4, sub = sb%4, l = k.
-    // sb_base = n * 8, is_off = l / 16 = k / 16 (0 or 1)
-    // Scale indices: sc[sb_base + is_off + sub*2] — depends on sub and k/16
     s += "        for (int sb = 0; sb < 8; sb++) {\n";
     s += "            int n = sb >> 2;\n";
     s += "            int sub = sb & 3;\n";
     s += "            int sb_base = n * 8;\n";
-    // ql/qh pointers offset by n (constant per sub-block pair)
     s += "            device const uchar *qlp = ql + n * 64;\n";
     s += "            device const uchar *qhp = qh_ptr + n * 32;\n";
     s += "\n";
-    s += "            for (uint t = lane; t < 256; t += 32) {\n";
-    s += "                int k = int(t >> 3);\n";
-    s += "                int r = int(t & 7);\n";
+    s += "            for (int t = lane; t < 256; t += 32) {\n";
+    s += "                int k = t >> 3;\n";
+    s += "                int r = t & 7;\n";
     s += "                half w = 0.0h;\n";
     s += "                if (valid) {\n";
-    s += "                    int is_off = k >> 4;\n";  // 0 for k<16, 1 for k>=16
-    // Dequant: switch on sub to extract q and ds
-    s += "                    int q; float ds;\n";
+    s += "                    int is_off = k >> 4;\n";
+    s += "                    int q; half ds;\n";
     s += "                    switch (sub) {\n";
-    s += "                        case 0: q = (int(qlp[k] & 0xF) | (int((qhp[k] >> 0) & 3) << 4)) - 32; ds = d_val * float(sc[sb_base+is_off+0]); break;\n";
-    s += "                        case 1: q = (int(qlp[k+32] & 0xF) | (int((qhp[k] >> 2) & 3) << 4)) - 32; ds = d_val * float(sc[sb_base+is_off+2]); break;\n";
-    s += "                        case 2: q = (int(qlp[k] >> 4) | (int((qhp[k] >> 4) & 3) << 4)) - 32; ds = d_val * float(sc[sb_base+is_off+4]); break;\n";
-    s += "                        default: q = (int(qlp[k+32] >> 4) | (int((qhp[k] >> 6) & 3) << 4)) - 32; ds = d_val * float(sc[sb_base+is_off+6]); break;\n";
+    s += "                        case 0: q = (int(qlp[k] & 0xF) | (int((qhp[k] >> 0) & 3) << 4)) - 32; ds = d_val * half(sc[sb_base+is_off+0]); break;\n";
+    s += "                        case 1: q = (int(qlp[k+32] & 0xF) | (int((qhp[k] >> 2) & 3) << 4)) - 32; ds = d_val * half(sc[sb_base+is_off+2]); break;\n";
+    s += "                        case 2: q = (int(qlp[k] >> 4) | (int((qhp[k] >> 4) & 3) << 4)) - 32; ds = d_val * half(sc[sb_base+is_off+4]); break;\n";
+    s += "                        default: q = (int(qlp[k+32] >> 4) | (int((qhp[k] >> 6) & 3) << 4)) - 32; ds = d_val * half(sc[sb_base+is_off+6]); break;\n";
     s += "                    }\n";
-    s += "                    w = half(ds * float(q));\n";
+    s += "                    w = ds * half(q);\n";
     s += "                }\n";
     s += "                tile[k * 9 + r] = w;\n";
     s += "            }\n";
     s += "            simdgroup_barrier(mem_flags::mem_threadgroup);\n";
     s += "\n";
-    s += "            for (uint ks = 0; ks < 4; ks++) {\n";
+    s += "            for (int ks = 0; ks < 4; ks++) {\n";
     s += "                simdgroup_half8x8 B;\n";
     s += "                simdgroup_load(B, tile + ks * 8 * 9, 9);\n";
     for g in 0..n_groups {
         let off = g * 8;
-        s += &format!("                {{ simdgroup_half8x8 A; simdgroup_load(A, X + (b_off + {off}u) * cols + bi * 256 + sb * 32 + ks * 8, cols); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
+        s += &format!("                {{ simdgroup_half8x8 A; simdgroup_load(A, X + (b_off + {off}) * icols + bi * 256 + sb * 32 + ks * 8, icols); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
     }
     s += "            }\n";
     s += "            simdgroup_barrier(mem_flags::mem_threadgroup);\n";
@@ -276,7 +299,7 @@ pub fn gen_matmul_q6k_mma_grid(name: &str, tile_b: u32) -> String {
     s += "\n";
     for g in 0..n_groups {
         let off = g * 8;
-        s += &format!("    simdgroup_store(C{g}, Y + (b_off + {off}u) * rows + row_base + sgid * 8, ulong(rows));\n");
+        s += &format!("    simdgroup_store(C{g}, Y + (b_off + {off}) * irows + row_base + sgid * 8, ulong(irows));\n");
     }
     s += "}\n\n";
     s
@@ -298,12 +321,14 @@ pub fn gen_matmul_q8_0_mma_grid(name: &str, tile_b: u32) -> String {
     s += "    uint3 tgid [[threadgroup_position_in_grid]],\n";
     s += "    uint3 tid  [[thread_position_in_threadgroup]]\n";
     s += ") {\n";
-    s += "    uint lid = tid.x;\n";
-    s += "    uint sgid = lid / 32;\n";
-    s += "    uint lane = lid % 32;\n";
-    s += "    uint row_base = tgid.x * 32;\n";
-    s += "    if (row_base >= rows) return;\n";
-    s += &format!("    uint b_off = tgid.y * {tile_b}u;\n");
+    // Signed integer indexing for Apple GPU vectorized loads.
+    s += "    int lid = int(tid.x);\n";
+    s += "    int sgid = lid / 32;\n";
+    s += "    int lane = lid % 32;\n";
+    s += "    int row_base = int(tgid.x) * 32;\n";
+    s += "    int icols = int(cols), irows = int(rows);\n";
+    s += "    if (row_base >= irows) return;\n";
+    s += &format!("    int b_off = int(tgid.y) * {tile_b};\n");
     s += "\n";
     s += "    threadgroup half tiles[4 * 32 * 9];\n";
     s += "    threadgroup half *tile = tiles + sgid * 32 * 9;\n";
@@ -320,16 +345,16 @@ pub fn gen_matmul_q8_0_mma_grid(name: &str, tile_b: u32) -> String {
         }
     }
     s += "\n";
-    s += "    uint blocks_per_row = cols / 32;\n";
-    s += "    uint row_bytes = blocks_per_row * 34;\n";
+    s += "    int blocks_per_row = icols / 32;\n";
+    s += "    int row_bytes = blocks_per_row * 34;\n";
     s += "\n";
-    s += "    for (uint bi = 0; bi < blocks_per_row; bi++) {\n";
-    s += "        for (uint t = lane; t < 256; t += 32) {\n";
-    s += "            uint k = t >> 3;\n";
-    s += "            uint r = t & 7;\n";
-    s += "            uint global_row = row_base + sgid * 8 + r;\n";
+    s += "    for (int bi = 0; bi < blocks_per_row; bi++) {\n";
+    s += "        for (int t = lane; t < 256; t += 32) {\n";
+    s += "            int k = t >> 3;\n";
+    s += "            int r = t & 7;\n";
+    s += "            int global_row = row_base + sgid * 8 + r;\n";
     s += "            half w = 0.0h;\n";
-    s += "            if (global_row < rows) {\n";
+    s += "            if (global_row < irows) {\n";
     s += "                device const uchar *bp = W + global_row * row_bytes + bi * 34;\n";
     s += "                half dd = *((device const half *)bp);\n";
     s += "                w = dd * half(int(((device const char *)(bp + 2))[k]));\n";
@@ -338,12 +363,12 @@ pub fn gen_matmul_q8_0_mma_grid(name: &str, tile_b: u32) -> String {
     s += "        }\n";
     s += "        simdgroup_barrier(mem_flags::mem_threadgroup);\n";
     s += "\n";
-    s += "        for (uint ks = 0; ks < 4; ks++) {\n";
+    s += "        for (int ks = 0; ks < 4; ks++) {\n";
     s += "            simdgroup_half8x8 B;\n";
     s += "            simdgroup_load(B, tile + ks * 8 * 9, 9);\n";
     for g in 0..n_groups {
         let off = g * 8;
-        s += &format!("            {{ simdgroup_half8x8 A; simdgroup_load(A, X + (b_off + {off}u) * cols + bi * 32 + ks * 8, cols); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
+        s += &format!("            {{ simdgroup_half8x8 A; simdgroup_load(A, X + (b_off + {off}) * icols + bi * 32 + ks * 8, icols); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
     }
     s += "        }\n";
     s += "        simdgroup_barrier(mem_flags::mem_threadgroup);\n";
@@ -351,7 +376,477 @@ pub fn gen_matmul_q8_0_mma_grid(name: &str, tile_b: u32) -> String {
     s += "\n";
     for g in 0..n_groups {
         let off = g * 8;
-        s += &format!("    simdgroup_store(C{g}, Y + (b_off + {off}u) * rows + row_base + sgid * 8, ulong(rows));\n");
+        s += &format!("    simdgroup_store(C{g}, Y + (b_off + {off}) * irows + row_base + sgid * 8, ulong(irows));\n");
+    }
+    s += "}\n\n";
+    s
+}
+
+// ── X-staged MMA grid kernels (batch matmul, b>1) ──
+// Key optimization: stage BOTH weights AND inputs in threadgroup memory.
+// Eliminates strided device-memory reads during MMA phase.
+// simdgroup_load(A) reads from TG memory (stride=33) instead of device memory (stride=8192).
+// Cost: +5280 bytes TG memory per TG, threadgroup_barrier instead of simdgroup_barrier.
+
+/// X-staged Q5K MMA kernel (no residual add).
+pub fn gen_matmul_q5k_xs(name: &str, tile_b: u32) -> String {
+    gen_matmul_q5k_xs_inner(name, tile_b, false)
+}
+
+/// X-staged Q5K MMA with fused residual add: Y += W × X.
+pub fn gen_matmul_q5k_xs_add(name: &str, tile_b: u32) -> String {
+    gen_matmul_q5k_xs_inner(name, tile_b, true)
+}
+
+fn gen_matmul_q5k_xs_inner(name: &str, tile_b: u32, residual_add: bool) -> String {
+    assert!(tile_b % 8 == 0, "tile_b must be multiple of 8");
+    let n_groups = tile_b / 8;
+    let x_stride = 33u32; // 32 + 1 padding to avoid bank conflicts
+    let mut s = String::with_capacity(16000);
+    s += &format!("kernel void {name}(\n");
+    s += "    device const uchar *W     [[buffer(0)]],\n";
+    s += "    device const half  *X     [[buffer(1)]],\n";
+    s += "    device half        *Y     [[buffer(2)]],\n";
+    s += "    constant uint      &cols  [[buffer(3)]],\n";
+    s += "    constant uint      &rows  [[buffer(4)]],\n";
+    s += "    constant uint      &batch [[buffer(5)]],\n";
+    s += "    uint3 tgid [[threadgroup_position_in_grid]],\n";
+    s += "    uint3 tid  [[thread_position_in_threadgroup]]\n";
+    s += ") {\n";
+    s += "    int lid = int(tid.x);\n";
+    s += "    int sgid = lid / 32;\n";
+    s += "    int lane = lid % 32;\n";
+    s += "    int row_base = int(tgid.x) * 32;\n";
+    s += "    int icols = int(cols), irows = int(rows), ibatch = int(batch);\n";
+    s += "    if (row_base >= irows) return;\n";
+    s += &format!("    int b_off = int(tgid.y) * {tile_b};\n");
+    s += "\n";
+    // TG memory: per-SG weight tile + shared X tile
+    s += "    threadgroup half w_tiles[4 * 32 * 9];\n";
+    s += "    threadgroup half *w_tile = w_tiles + sgid * 32 * 9;\n";
+    s += &format!("    threadgroup half x_tile[{tile_b} * {x_stride}];\n");
+    s += "\n";
+    // Accumulators
+    if residual_add {
+        for g in 0..n_groups {
+            let off = g * 8;
+            s += &format!("    simdgroup_half8x8 C{g};\n");
+            s += &format!("    simdgroup_load(C{g}, Y + (b_off + {off}) * irows + row_base + sgid * 8, ulong(irows));\n");
+        }
+    } else {
+        for g in 0..n_groups {
+            if g % 4 == 0 {
+                let end = std::cmp::min(g + 4, n_groups);
+                s += "    simdgroup_half8x8 ";
+                for i in g..end {
+                    if i > g { s += ", "; }
+                    s += &format!("C{i}(0.0h)");
+                }
+                s += ";\n";
+            }
+        }
+    }
+    s += "\n";
+    // Q5K setup
+    s += "    int blocks_per_row = icols / 256;\n";
+    s += "    int row_bytes = blocks_per_row * 176;\n";
+    s += "    int my_r = lane & 7;\n";
+    s += "    int global_row = row_base + sgid * 8 + my_r;\n";
+    s += "    bool valid = global_row < irows;\n";
+    s += "    device const uchar *row_w = W + global_row * row_bytes;\n";
+    s += "\n";
+    s += "    for (int bi = 0; bi < blocks_per_row; bi++) {\n";
+    s += "        device const uchar *blk = row_w + bi * 176;\n";
+    s += "        float d_val = valid ? float(*((device const half *)(blk))) : 0.0;\n";
+    s += "        float dmin_val = valid ? float(*((device const half *)(blk + 2))) : 0.0;\n";
+    s += "        device const uchar *scales = blk + 4;\n";
+    s += "        device const uchar *qh = blk + 16;\n";
+    s += "        device const uchar *qs = blk + 48;\n";
+    s += "\n";
+    s += "        for (int sb = 0; sb < 8; sb++) {\n";
+    // Stage W (same as original)
+    s += "            float ds = 0.0, dm = 0.0;\n";
+    s += "            if (valid) {\n";
+    s += "                float sc, mn;\n";
+    s += "                if (sb < 4) { sc = float(scales[sb] & 63); mn = float(scales[sb + 4] & 63); }\n";
+    s += "                else { sc = float((scales[sb + 4] & 0xF) | ((scales[sb - 4] >> 6) << 4)); mn = float((scales[sb + 4] >> 4) | ((scales[sb] >> 6) << 4)); }\n";
+    s += "                ds = d_val * sc; dm = dmin_val * mn;\n";
+    s += "            }\n";
+    s += "            int pair = sb >> 1;\n";
+    s += "            int sub = sb & 1;\n";
+    s += "            for (int t = lane; t < 256; t += 32) {\n";
+    s += "                int k = t >> 3;\n";
+    s += "                int r = t & 7;\n";
+    s += "                half w = 0.0h;\n";
+    s += "                if (valid) {\n";
+    s += "                    int qb = int(qs[pair * 32 + k]);\n";
+    s += "                    int nibble = (qb >> (sub * 4)) & 0xF;\n";
+    s += "                    int hb = (int(qh[k]) >> (pair * 2 + sub)) & 1;\n";
+    s += "                    w = half(ds * float(nibble + hb * 16) - dm);\n";
+    s += "                }\n";
+    s += "                w_tile[k * 9 + r] = w;\n";
+    s += "            }\n";
+    // Stage X: cooperative load of input tile into TG memory
+    // Layout: x_tile[batch * x_stride + reduction_col] for fast simdgroup_load
+    s += &format!("            int x_col = bi * 256 + sb * 32;\n");
+    s += &format!("            for (int idx = lid; idx < 32 * {tile_b}; idx += 128) {{\n");
+    s += &format!("                int xk = idx & 31;\n");
+    s += &format!("                int xb = idx >> 5;\n");
+    s += &format!("                int ab = b_off + xb;\n");
+    s += &format!("                int ac = x_col + xk;\n");
+    s += &format!("                x_tile[xb * {x_stride} + xk] = (ab < ibatch && ac < icols) ? X[ab * icols + ac] : half(0.0h);\n");
+    s += "            }\n";
+    // Barrier: ensures both W and X tiles are visible to all SGs
+    s += "            threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "\n";
+    // MMA: read both W and X from TG memory
+    s += "            for (int ks = 0; ks < 4; ks++) {\n";
+    s += "                simdgroup_half8x8 B;\n";
+    s += "                simdgroup_load(B, w_tile + ks * 8 * 9, 9);\n";
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("                {{ simdgroup_half8x8 A; simdgroup_load(A, x_tile + {off} * {x_stride} + ks * 8, {x_stride}); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
+    }
+    s += "            }\n";
+    s += "            threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "        }\n";
+    s += "    }\n";
+    s += "\n";
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("    simdgroup_store(C{g}, Y + (b_off + {off}) * irows + row_base + sgid * 8, ulong(irows));\n");
+    }
+    s += "}\n\n";
+    s
+}
+
+/// X-staged Q6K MMA kernel (no residual add).
+pub fn gen_matmul_q6k_xs(name: &str, tile_b: u32) -> String {
+    gen_matmul_q6k_xs_inner(name, tile_b, false)
+}
+
+/// X-staged Q6K MMA with fused residual add: Y += W × X.
+pub fn gen_matmul_q6k_xs_add(name: &str, tile_b: u32) -> String {
+    gen_matmul_q6k_xs_inner(name, tile_b, true)
+}
+
+fn gen_matmul_q6k_xs_inner(name: &str, tile_b: u32, residual_add: bool) -> String {
+    assert!(tile_b % 8 == 0, "tile_b must be multiple of 8");
+    let n_groups = tile_b / 8;
+    let x_stride = 33u32;
+    let mut s = String::with_capacity(16000);
+    s += &format!("kernel void {name}(\n");
+    s += "    device const uchar *W     [[buffer(0)]],\n";
+    s += "    device const half  *X     [[buffer(1)]],\n";
+    s += "    device half        *Y     [[buffer(2)]],\n";
+    s += "    constant uint      &cols  [[buffer(3)]],\n";
+    s += "    constant uint      &rows  [[buffer(4)]],\n";
+    s += "    constant uint      &batch [[buffer(5)]],\n";
+    s += "    uint3 tgid [[threadgroup_position_in_grid]],\n";
+    s += "    uint3 tid  [[thread_position_in_threadgroup]]\n";
+    s += ") {\n";
+    s += "    int lid = int(tid.x);\n";
+    s += "    int sgid = lid / 32;\n";
+    s += "    int lane = lid % 32;\n";
+    s += "    int row_base = int(tgid.x) * 32;\n";
+    s += "    int icols = int(cols), irows = int(rows), ibatch = int(batch);\n";
+    s += "    if (row_base >= irows) return;\n";
+    s += &format!("    int b_off = int(tgid.y) * {tile_b};\n");
+    s += "\n";
+    s += "    threadgroup half w_tiles[4 * 32 * 9];\n";
+    s += "    threadgroup half *w_tile = w_tiles + sgid * 32 * 9;\n";
+    s += &format!("    threadgroup half x_tile[{tile_b} * {x_stride}];\n");
+    s += "\n";
+    if residual_add {
+        for g in 0..n_groups {
+            let off = g * 8;
+            s += &format!("    simdgroup_half8x8 C{g};\n");
+            s += &format!("    simdgroup_load(C{g}, Y + (b_off + {off}) * irows + row_base + sgid * 8, ulong(irows));\n");
+        }
+    } else {
+        for g in 0..n_groups {
+            if g % 4 == 0 {
+                let end = std::cmp::min(g + 4, n_groups);
+                s += "    simdgroup_half8x8 ";
+                for i in g..end {
+                    if i > g { s += ", "; }
+                    s += &format!("C{i}(0.0h)");
+                }
+                s += ";\n";
+            }
+        }
+    }
+    s += "\n";
+    s += "    int blocks_per_row = icols / 256;\n";
+    s += "    int row_bytes = blocks_per_row * 210;\n";
+    s += "    int my_r = lane & 7;\n";
+    s += "    int global_row = row_base + sgid * 8 + my_r;\n";
+    s += "    bool valid = global_row < irows;\n";
+    s += "    device const uchar *row_w = W + global_row * row_bytes;\n";
+    s += "\n";
+    s += "    for (int bi = 0; bi < blocks_per_row; bi++) {\n";
+    s += "        device const uchar *blk = row_w + bi * 210;\n";
+    s += "        device const uchar *ql = blk;\n";
+    s += "        device const uchar *qh_ptr = blk + 128;\n";
+    s += "        device const char *sc = (device const char *)(blk + 192);\n";
+    s += "        float d_val = valid ? float(*((device const half *)(blk + 208))) : 0.0;\n";
+    s += "\n";
+    s += "        for (int sb = 0; sb < 8; sb++) {\n";
+    s += "            int n = sb >> 2;\n";
+    s += "            int sub = sb & 3;\n";
+    s += "            int sb_base = n * 8;\n";
+    s += "            device const uchar *qlp = ql + n * 64;\n";
+    s += "            device const uchar *qhp = qh_ptr + n * 32;\n";
+    s += "\n";
+    // Stage W
+    s += "            for (int t = lane; t < 256; t += 32) {\n";
+    s += "                int k = t >> 3;\n";
+    s += "                int r = t & 7;\n";
+    s += "                half w = 0.0h;\n";
+    s += "                if (valid) {\n";
+    s += "                    int is_off = k >> 4;\n";
+    s += "                    int q; float ds;\n";
+    s += "                    switch (sub) {\n";
+    s += "                        case 0: q = (int(qlp[k] & 0xF) | (int((qhp[k] >> 0) & 3) << 4)) - 32; ds = d_val * float(sc[sb_base+is_off+0]); break;\n";
+    s += "                        case 1: q = (int(qlp[k+32] & 0xF) | (int((qhp[k] >> 2) & 3) << 4)) - 32; ds = d_val * float(sc[sb_base+is_off+2]); break;\n";
+    s += "                        case 2: q = (int(qlp[k] >> 4) | (int((qhp[k] >> 4) & 3) << 4)) - 32; ds = d_val * float(sc[sb_base+is_off+4]); break;\n";
+    s += "                        default: q = (int(qlp[k+32] >> 4) | (int((qhp[k] >> 6) & 3) << 4)) - 32; ds = d_val * float(sc[sb_base+is_off+6]); break;\n";
+    s += "                    }\n";
+    s += "                    w = half(ds * float(q));\n";
+    s += "                }\n";
+    s += "                w_tile[k * 9 + r] = w;\n";
+    s += "            }\n";
+    // Stage X
+    s += &format!("            int x_col = bi * 256 + sb * 32;\n");
+    s += &format!("            for (int idx = lid; idx < 32 * {tile_b}; idx += 128) {{\n");
+    s += &format!("                int xk = idx & 31;\n");
+    s += &format!("                int xb = idx >> 5;\n");
+    s += &format!("                int ab = b_off + xb;\n");
+    s += &format!("                int ac = x_col + xk;\n");
+    s += &format!("                x_tile[xb * {x_stride} + xk] = (ab < ibatch && ac < icols) ? X[ab * icols + ac] : half(0.0h);\n");
+    s += "            }\n";
+    s += "            threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "\n";
+    // MMA from TG memory
+    s += "            for (int ks = 0; ks < 4; ks++) {\n";
+    s += "                simdgroup_half8x8 B;\n";
+    s += "                simdgroup_load(B, w_tile + ks * 8 * 9, 9);\n";
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("                {{ simdgroup_half8x8 A; simdgroup_load(A, x_tile + {off} * {x_stride} + ks * 8, {x_stride}); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
+    }
+    s += "            }\n";
+    s += "            threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "        }\n";
+    s += "    }\n";
+    s += "\n";
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("    simdgroup_store(C{g}, Y + (b_off + {off}) * irows + row_base + sgid * 8, ulong(irows));\n");
+    }
+    s += "}\n\n";
+    s
+}
+
+/// X-staged Q8_0 MMA kernel.
+pub fn gen_matmul_q8_0_xs(name: &str, tile_b: u32) -> String {
+    assert!(tile_b % 8 == 0, "tile_b must be multiple of 8");
+    let n_groups = tile_b / 8;
+    let x_stride = 33u32;
+    let mut s = String::with_capacity(12000);
+    s += &format!("kernel void {name}(\n");
+    s += "    device const uchar *W     [[buffer(0)]],\n";
+    s += "    device const half  *X     [[buffer(1)]],\n";
+    s += "    device half        *Y     [[buffer(2)]],\n";
+    s += "    constant uint      &cols  [[buffer(3)]],\n";
+    s += "    constant uint      &rows  [[buffer(4)]],\n";
+    s += "    constant uint      &batch [[buffer(5)]],\n";
+    s += "    uint3 tgid [[threadgroup_position_in_grid]],\n";
+    s += "    uint3 tid  [[thread_position_in_threadgroup]]\n";
+    s += ") {\n";
+    s += "    int lid = int(tid.x);\n";
+    s += "    int sgid = lid / 32;\n";
+    s += "    int lane = lid % 32;\n";
+    s += "    int row_base = int(tgid.x) * 32;\n";
+    s += "    int icols = int(cols), irows = int(rows), ibatch = int(batch);\n";
+    s += "    if (row_base >= irows) return;\n";
+    s += &format!("    int b_off = int(tgid.y) * {tile_b};\n");
+    s += "\n";
+    s += "    threadgroup half w_tiles[4 * 32 * 9];\n";
+    s += "    threadgroup half *w_tile = w_tiles + sgid * 32 * 9;\n";
+    s += &format!("    threadgroup half x_tile[{tile_b} * {x_stride}];\n");
+    s += "\n";
+    for g in 0..n_groups {
+        if g % 4 == 0 {
+            let end = std::cmp::min(g + 4, n_groups);
+            s += "    simdgroup_half8x8 ";
+            for i in g..end {
+                if i > g { s += ", "; }
+                s += &format!("C{i}(0.0h)");
+            }
+            s += ";\n";
+        }
+    }
+    s += "\n";
+    // Q8_0: 32 elements per block, 34 bytes (half d + 32 int8 quants)
+    s += "    int blocks_per_row = icols / 32;\n";
+    s += "    int row_bytes = blocks_per_row * 34;\n";
+    s += "\n";
+    s += "    for (int bi = 0; bi < blocks_per_row; bi++) {\n";
+    // Stage W
+    s += "        for (int t = lane; t < 256; t += 32) {\n";
+    s += "            int k = t >> 3;\n";
+    s += "            int r = t & 7;\n";
+    s += "            int global_row = row_base + sgid * 8 + r;\n";
+    s += "            half w = 0.0h;\n";
+    s += "            if (global_row < irows) {\n";
+    s += "                device const uchar *bp = W + global_row * row_bytes + bi * 34;\n";
+    s += "                half dd = *((device const half *)bp);\n";
+    s += "                w = dd * half(int(((device const char *)(bp + 2))[k]));\n";
+    s += "            }\n";
+    s += "            w_tile[k * 9 + r] = w;\n";
+    s += "        }\n";
+    // Stage X (32 elements × tile_b batch positions)
+    s += &format!("        int x_col = bi * 32;\n");
+    s += &format!("        for (int idx = lid; idx < 32 * {tile_b}; idx += 128) {{\n");
+    s += &format!("            int xk = idx & 31;\n");
+    s += &format!("            int xb = idx >> 5;\n");
+    s += &format!("            int ab = b_off + xb;\n");
+    s += &format!("            int ac = x_col + xk;\n");
+    s += &format!("            x_tile[xb * {x_stride} + xk] = (ab < ibatch && ac < icols) ? X[ab * icols + ac] : half(0.0h);\n");
+    s += "        }\n";
+    s += "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "\n";
+    // MMA from TG memory
+    s += "        for (int ks = 0; ks < 4; ks++) {\n";
+    s += "            simdgroup_half8x8 B;\n";
+    s += "            simdgroup_load(B, w_tile + ks * 8 * 9, 9);\n";
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("            {{ simdgroup_half8x8 A; simdgroup_load(A, x_tile + {off} * {x_stride} + ks * 8, {x_stride}); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
+    }
+    s += "        }\n";
+    s += "        threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "    }\n";
+    s += "\n";
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("    simdgroup_store(C{g}, Y + (b_off + {off}) * irows + row_base + sgid * 8, ulong(irows));\n");
+    }
+    s += "}\n\n";
+    s
+}
+
+/// X-staged Q6K MMA with fused silu: Y += Wdown × silu(Gate) * Up.
+/// Eliminates ffn_mid buffer and silu_mul dispatch entirely.
+/// X staging reads Gate+Up, computes silu(gate)*up inline, stores to x_tile.
+pub fn gen_matmul_q6k_xs_silu_add(name: &str, tile_b: u32) -> String {
+    assert!(tile_b % 8 == 0, "tile_b must be multiple of 8");
+    let n_groups = tile_b / 8;
+    let x_stride = 33u32;
+    let mut s = String::with_capacity(16000);
+    s += &format!("kernel void {name}(\n");
+    s += "    device const uchar *W     [[buffer(0)]],\n";
+    s += "    device const half  *Gate  [[buffer(1)]],\n";
+    s += "    device const half  *Up    [[buffer(2)]],\n";
+    s += "    device half        *Y     [[buffer(3)]],\n";
+    s += "    constant uint      &cols  [[buffer(4)]],\n";
+    s += "    constant uint      &rows  [[buffer(5)]],\n";
+    s += "    constant uint      &batch [[buffer(6)]],\n";
+    s += "    uint3 tgid [[threadgroup_position_in_grid]],\n";
+    s += "    uint3 tid  [[thread_position_in_threadgroup]]\n";
+    s += ") {\n";
+    s += "    int lid = int(tid.x);\n";
+    s += "    int sgid = lid / 32;\n";
+    s += "    int lane = lid % 32;\n";
+    s += "    int row_base = int(tgid.x) * 32;\n";
+    s += "    int icols = int(cols), irows = int(rows), ibatch = int(batch);\n";
+    s += "    if (row_base >= irows) return;\n";
+    s += &format!("    int b_off = int(tgid.y) * {tile_b};\n");
+    s += "\n";
+    s += "    threadgroup half w_tiles[4 * 32 * 9];\n";
+    s += "    threadgroup half *w_tile = w_tiles + sgid * 32 * 9;\n";
+    s += &format!("    threadgroup half x_tile[{tile_b} * {x_stride}];\n");
+    s += "\n";
+    // Residual add: load accumulators from Y
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("    simdgroup_half8x8 C{g};\n");
+        s += &format!("    simdgroup_load(C{g}, Y + (b_off + {off}) * irows + row_base + sgid * 8, ulong(irows));\n");
+    }
+    s += "\n";
+    s += "    int blocks_per_row = icols / 256;\n";
+    s += "    int row_bytes = blocks_per_row * 210;\n";
+    s += "    int my_r = lane & 7;\n";
+    s += "    int global_row = row_base + sgid * 8 + my_r;\n";
+    s += "    bool valid = global_row < irows;\n";
+    s += "    device const uchar *row_w = W + global_row * row_bytes;\n";
+    s += "\n";
+    s += "    for (int bi = 0; bi < blocks_per_row; bi++) {\n";
+    s += "        device const uchar *blk = row_w + bi * 210;\n";
+    s += "        device const uchar *ql = blk;\n";
+    s += "        device const uchar *qh_ptr = blk + 128;\n";
+    s += "        device const char *sc = (device const char *)(blk + 192);\n";
+    s += "        float d_val = valid ? float(*((device const half *)(blk + 208))) : 0.0;\n";
+    s += "\n";
+    s += "        for (int sb = 0; sb < 8; sb++) {\n";
+    s += "            int n = sb >> 2;\n";
+    s += "            int sub = sb & 3;\n";
+    s += "            int sb_base = n * 8;\n";
+    s += "            device const uchar *qlp = ql + n * 64;\n";
+    s += "            device const uchar *qhp = qh_ptr + n * 32;\n";
+    s += "\n";
+    // Stage W (same as Q6K)
+    s += "            for (int t = lane; t < 256; t += 32) {\n";
+    s += "                int k = t >> 3;\n";
+    s += "                int r = t & 7;\n";
+    s += "                half w = 0.0h;\n";
+    s += "                if (valid) {\n";
+    s += "                    int is_off = k >> 4;\n";
+    s += "                    int q; float ds;\n";
+    s += "                    switch (sub) {\n";
+    s += "                        case 0: q = (int(qlp[k] & 0xF) | (int((qhp[k] >> 0) & 3) << 4)) - 32; ds = d_val * float(sc[sb_base+is_off+0]); break;\n";
+    s += "                        case 1: q = (int(qlp[k+32] & 0xF) | (int((qhp[k] >> 2) & 3) << 4)) - 32; ds = d_val * float(sc[sb_base+is_off+2]); break;\n";
+    s += "                        case 2: q = (int(qlp[k] >> 4) | (int((qhp[k] >> 4) & 3) << 4)) - 32; ds = d_val * float(sc[sb_base+is_off+4]); break;\n";
+    s += "                        default: q = (int(qlp[k+32] >> 4) | (int((qhp[k] >> 6) & 3) << 4)) - 32; ds = d_val * float(sc[sb_base+is_off+6]); break;\n";
+    s += "                    }\n";
+    s += "                    w = half(ds * float(q));\n";
+    s += "                }\n";
+    s += "                w_tile[k * 9 + r] = w;\n";
+    s += "            }\n";
+    // Stage X with fused silu: x_tile = silu(Gate) * Up
+    s += &format!("            int x_col = bi * 256 + sb * 32;\n");
+    s += &format!("            for (int idx = lid; idx < 32 * {tile_b}; idx += 128) {{\n");
+    s += &format!("                int xk = idx & 31;\n");
+    s += &format!("                int xb = idx >> 5;\n");
+    s += &format!("                int ab = b_off + xb;\n");
+    s += &format!("                int ac = x_col + xk;\n");
+    s += "                half val = 0.0h;\n";
+    s += "                if (ab < ibatch && ac < icols) {\n";
+    s += "                    float g = float(Gate[ab * icols + ac]);\n";
+    s += "                    float u = float(Up[ab * icols + ac]);\n";
+    s += "                    val = half((g / (1.0 + exp(-g))) * u);\n";
+    s += "                }\n";
+    s += &format!("                x_tile[xb * {x_stride} + xk] = val;\n");
+    s += "            }\n";
+    s += "            threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "\n";
+    // MMA from TG memory
+    s += "            for (int ks = 0; ks < 4; ks++) {\n";
+    s += "                simdgroup_half8x8 B;\n";
+    s += "                simdgroup_load(B, w_tile + ks * 8 * 9, 9);\n";
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("                {{ simdgroup_half8x8 A; simdgroup_load(A, x_tile + {off} * {x_stride} + ks * 8, {x_stride}); simdgroup_multiply_accumulate(C{g}, A, B, C{g}); }}\n");
+    }
+    s += "            }\n";
+    s += "            threadgroup_barrier(mem_flags::mem_threadgroup);\n";
+    s += "        }\n";
+    s += "    }\n";
+    s += "\n";
+    for g in 0..n_groups {
+        let off = g * 8;
+        s += &format!("    simdgroup_store(C{g}, Y + (b_off + {off}) * irows + row_base + sgid * 8, ulong(irows));\n");
     }
     s += "}\n\n";
     s
@@ -822,10 +1317,16 @@ kernel void argmax_batch(
 /// Build all batch Metal source: Q5K/Q6K/Q8_0 MMA + matvec + embed + element-wise.
 pub fn all_batch_kernels() -> String {
     let mut s = HEADER_STR.to_string();
-    // MMA staging grid kernels (batch matmul, tile_b=80)
+    // Original MMA staging grid kernels (batch matmul, tile_b=80)
+    // simdgroup_barrier + direct device X reads — 58 tok/s baseline
+    // (X-staged variants with threadgroup_barrier regressed to 44 tok/s)
     s += &gen_matmul_q5k_mma_grid("matmul_q5k_grid", 80);
+    s += &gen_matmul_q5k_mma_grid_add("matmul_q5k_grid_add", 80);
     s += &gen_matmul_q6k_mma_grid("matmul_q6k_grid", 80);
+    s += &gen_matmul_q6k_mma_grid_add("matmul_q6k_grid_add", 80);
     s += &gen_matmul_q8_0_mma_grid("matmul_q8_0_grid", 80);
+    // Fused silu+Wdown (X-staged, currently unused — kept for reference)
+    s += &gen_matmul_q6k_xs_silu_add("matmul_q6k_grid_silu_add", 80);
     // Scalar matvec (n=1 decode)
     s += &gen_matvec_q5k_f16("matvec_q5k_f16");
     s += &gen_matvec_q6k_f16("matvec_q6k_f16");

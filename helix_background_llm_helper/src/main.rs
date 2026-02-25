@@ -238,11 +238,19 @@ fn run_bench_batch(path_arg: Option<&String>) {
     eprintln!("  Batch (pos=0 fixed):   {:.2}ms = {:.0} tok/s", fixed_per * 1000.0, fixed_tps);
 
     // Benchmark: advancing positions (realistic — attention grows, limited to KV cache)
+    // Use random tokens per iteration to prevent Metal from caching/eliding computation
+    let vocab = gguf.config.vocab_size;
     let max_pos_iters = std::cmp::min(iters, (2048 - bs) / bs);
     if max_pos_iters > 0 {
+        let mut rng_state: u64 = 0xdeadbeef;
         let t0 = std::time::Instant::now();
         for i in 0..max_pos_iters {
-            infer_batch::forward_batch(&mdl, &batch, &tokens, i * bs);
+            let tok: Vec<u32> = (0..bs).map(|_| {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (rng_state >> 33) as u32 % vocab
+            }).collect();
+            infer_batch::forward_batch(&mdl, &batch, &tok, i * bs);
+            let _ = infer_batch::argmax_batch(&batch, bs);
         }
         let per_iter = t0.elapsed().as_secs_f64() / max_pos_iters as f64;
         let tok_per_sec = bs as f64 / per_iter;
@@ -257,6 +265,28 @@ fn run_bench_batch(path_arg: Option<&String>) {
     let single_per = t0.elapsed().as_secs_f64() / iters as f64;
     eprintln!("  Single-token (B=1):    {:.2}ms = {:.0} tok/s", single_per * 1000.0, 1.0 / single_per);
     eprintln!("  Batch speedup: {:.1}x", fixed_tps * single_per);
+
+    // 70B: 80 layers × 7 matmuls × avg(8192×28672) × 2 FLOPs ≈ 139.2 GFLOP/token
+    let flop_per_token = 139.2e9_f64;
+
+    // Scaling curve: test multiple batch sizes
+    eprintln!("\n=== Batch Scaling Curve (pos=0) ===\n");
+    for &test_b in &[80u32, 160, 320, 480, 640, 800, 960, 1024] {
+        let tok: Vec<u32> = vec![bos; test_b as usize];
+        // Warmup
+        infer_batch::forward_batch(&mdl, &batch, &tok, 0);
+        let iters_s = 5u32;
+        let t = std::time::Instant::now();
+        for _ in 0..iters_s {
+            infer_batch::forward_batch(&mdl, &batch, &tok, 0);
+        }
+        let per = t.elapsed().as_secs_f64() / iters_s as f64;
+        let tps = test_b as f64 / per;
+        let tflops = tps * flop_per_token / 1e12;
+        let pct = tflops / 14.2 * 100.0;
+        eprintln!("  B={:>4}: {:>8.2}ms = {:>4.0} tok/s | {:.2} TFLOP/s ({:.1}% peak)",
+            test_b, per * 1000.0, tps, tflops, pct);
+    }
 
     eprintln!("\n=== Done ===");
 }
@@ -339,7 +369,8 @@ fn run_bench_profile(path_arg: Option<&String>) {
     eprintln!("  Output proj: {:.2}ms ({:.1}%)", t_out, t_out / t_total * 100.0);
 
     eprintln!("\n=== FLOP Analysis ===\n");
-    let flop_per_token = 2.474e9_f64;
+    // 70B: 80 layers × 7 matmuls × avg(8192×28672) × 2 FLOPs ≈ 139.2 GFLOP/token
+    let flop_per_token = 139.2e9_f64;
     let total_flop = flop_per_token * bs as f64;
     let achieved_tflops = total_flop / (real / 1000.0) / 1e12;
     eprintln!("  {:.2} GFLOP per token × {} tokens = {:.2} GFLOP per batch",
